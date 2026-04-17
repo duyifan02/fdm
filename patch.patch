@@ -1,0 +1,2490 @@
+diff --git a/.gitignore b/.gitignore
+index a518e02..02f0196 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -17,7 +17,10 @@ exts/fdm/data/Terrains/
+ 
+ # possible logs
+ **/logs/*
+-
++# Keep agent session logs under version control (exception to the rule above)
++!.agent/logs/
++!.agent/logs/**
++tmp/
+ # Python
+ .DS_Store
+ **/*.egg-info/
+@@ -46,3 +49,20 @@ docker/.container.cfg
+ **/.neptune/*
+ docker/artifacts/
+ *.tmp
++
++# Large joint-state dumps (GitHub 100MB limit; keep local only)
++d5_forward_joint_states.txt
++d5_forward_joint_states_v2.txt
++joint_states.txt
++
++# 2026-04-10 本地 IDE / 工具目录，非业务源码
++.cursor/
++.codex
++.codex/
++.marscode/
++
++# 2026-04-10 D5 导出 USD 体积约 265MB，超出 GitHub 单文件建议上限；用 git lfs 或网盘单独同步
++exts/fdm/data/robots/d5/d5w.usd
++
++# 2026-04-10 可选：预训练 encoder 权重较大，若不上传可取消下行注释
++# exts/fdm/data/Encoders/*.pt
+diff --git a/exts/fdm/fdm/agents/sampling_planner_agent.py b/exts/fdm/fdm/agents/sampling_planner_agent.py
+index d3d1825..9e06264 100644
+--- a/exts/fdm/fdm/agents/sampling_planner_agent.py
++++ b/exts/fdm/fdm/agents/sampling_planner_agent.py
+@@ -53,6 +53,8 @@ class SamplingPlannerAgent(Agent):
+             self._runner.cfg.model_cfg.prediction_horizon,
+             device=self._runner.env.device,
+             population_size=self.cfg.population_size,
++            lower_bound=[self.cfg.ranges.lin_vel_x[0], self.cfg.ranges.lin_vel_y[0], self.cfg.ranges.ang_vel_z[0]],
++            upper_bound=[self.cfg.ranges.lin_vel_x[1], self.cfg.ranges.lin_vel_y[1], self.cfg.ranges.ang_vel_z[1]],
+         )
+         initialized_planner_cfg = omegaconf.OmegaConf.create(planner_cfg)
+         self.planner: SimpleSE2TrajectoryOptimizer = hydra.utils.instantiate(initialized_planner_cfg.to)
+diff --git a/exts/fdm/fdm/data_buffers/dataset/trajectory_dataset.py b/exts/fdm/fdm/data_buffers/dataset/trajectory_dataset.py
+index f54ed51..dedd849 100644
+--- a/exts/fdm/fdm/data_buffers/dataset/trajectory_dataset.py
++++ b/exts/fdm/fdm/data_buffers/dataset/trajectory_dataset.py
+@@ -75,6 +75,14 @@ class TrajectoryDataset(Dataset):
+     def num_samples(self) -> int:
+         return self._actual_nbr_samples
+ 
++    @property
++    def command_velocity_ranges(self) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
++        # 2026-04-10 FDMBaseModelCfg 默认 command_velocity_ranges=None；getattr 在「键存在且为 None」时不会用默认值，populate 解包会崩
++        v = getattr(self.model_cfg, "command_velocity_ranges", None)
++        if v is not None:
++            return v
++        return (VEL_RANGE_X, VEL_RANGE_Y, VEL_RANGE_YAW)
++
+     ##
+     # Operations
+     ##
+@@ -389,7 +397,8 @@ class TrajectoryDataset(Dataset):
+         max_acceleration = torch.concatenate([max_lin_acceleration, max_ang_acceleration], dim=0)
+ 
+         # check the maximum velocity is not more than the maximum commanded velocity
+-        max_possible_velocity = (VEL_RANGE_X[1] ** 2 + VEL_RANGE_Y[1] ** 2) ** 0.5
++        vel_range_x, vel_range_y, vel_range_yaw = self.command_velocity_ranges
++        max_possible_velocity = (vel_range_x[1] ** 2 + vel_range_y[1] ** 2) ** 0.5
+         collision_samples = self.states[..., 4].any(dim=1)
+         max_velocity_non_collision = torch.concatenate(
+             [
+@@ -400,7 +409,7 @@ class TrajectoryDataset(Dataset):
+         )
+         if torch.any(
+             max_velocity_non_collision
+-            > torch.tensor([max_possible_velocity, max_possible_velocity, VEL_RANGE_YAW[1]]) * 1.1
++            > torch.tensor([max_possible_velocity, max_possible_velocity, vel_range_yaw[1]]) * 1.1
+         ):
+             # NOTE: When the robot is "falling" the velocity, especially the angular velocity, can be very high
+             #       while the robot does not necessary collide
+@@ -409,7 +418,7 @@ class TrajectoryDataset(Dataset):
+             )
+             exceeding_cases = torch.any(
+                 non_colliding_vels
+-                > torch.tensor([[[max_possible_velocity, max_possible_velocity, VEL_RANGE_YAW[1]]]]) * 1.1,
++                > torch.tensor([[[max_possible_velocity, max_possible_velocity, vel_range_yaw[1]]]]) * 1.1,
+                 dim=-1,
+             )
+             # get the z diff for the exceeding cases
+@@ -418,7 +427,7 @@ class TrajectoryDataset(Dataset):
+             print(
+                 f"[WARNING] Maximum observed velocity {max_velocity_non_collision.cpu().tolist()} is higher in"
+                 f" {exceeding_cases.sum().item()} cases than the maximum commanded velocity"
+-                f" {[max_possible_velocity, max_possible_velocity, VEL_RANGE_YAW[1]]}! In"
++                f" {[max_possible_velocity, max_possible_velocity, vel_range_yaw[1]]}! In"
+                 f" {(torch.abs(z_diff_exceeding) > 0.1).sum().item()} cases the z diff is larger than 0.1m!"
+             )
+ 
+diff --git a/exts/fdm/fdm/data_buffers/replay_buffer/replay_buffer.py b/exts/fdm/fdm/data_buffers/replay_buffer/replay_buffer.py
+index 6eaccda..e2b75cc 100644
+--- a/exts/fdm/fdm/data_buffers/replay_buffer/replay_buffer.py
++++ b/exts/fdm/fdm/data_buffers/replay_buffer/replay_buffer.py
+@@ -6,6 +6,8 @@
+ 
+ from __future__ import annotations
+ 
++import math
++
+ import torch
+ 
+ from isaaclab.envs import ManagerBasedRLEnv
+@@ -176,61 +178,110 @@ class ReplayBuffer:
+ 
+     def fill_leftover_envs(self):
+         """Fill the buffer for the environments that are not yet filled"""
+-        # identify collision for each environment
+-        collision_indices = torch.nonzero(torch.any(self.states[..., 7], dim=-1))
+-
+-        # get the last collision index
+-        collision_envs, unique_indices = torch.unique(collision_indices[:, 0], return_inverse=True)
+-        env_split_data = torch.split(collision_indices[:, 1], torch.bincount(unique_indices).tolist())
+-        collision_max_indices = torch.tensor([torch.max(env_indices) for env_indices in env_split_data])
+-
+-        # Note: add 1 to collision_max_idx to avoid cropping the collision event
+-        collision_max_indices += 1
++        envs_to_fill = self._ALL_INDICES[~self.env_buffer_filled].type(torch.long)
++        if len(envs_to_fill) == 0:
++            return
+ 
+-        # check if any environment has never collided
+-        not_collided_envs = list(set(self._ALL_INDICES.tolist()) - set(collision_envs.tolist()))
+-        collision_envs = torch.concatenate((collision_envs, torch.tensor(not_collided_envs)))
+-        collision_max_indices = torch.concatenate((collision_max_indices, torch.zeros(len(not_collided_envs))))
++        # identify collision for each environment
++        collision_indices = torch.nonzero(torch.any(self.states[..., 7], dim=-1), as_tuple=False)
++        collision_max_indices = torch.zeros(self.env.num_envs, device=self.device, dtype=torch.long)
++        if len(collision_indices) > 0:
++            collision_envs, unique_indices = torch.unique(collision_indices[:, 0], return_inverse=True)
++            env_split_data = torch.split(collision_indices[:, 1], torch.bincount(unique_indices).tolist())
++            collision_max_indices[collision_envs] = torch.tensor(
++                [torch.max(env_indices) + 1 for env_indices in env_split_data],
++                device=self.device,
++                dtype=torch.long,
++            )
+ 
+-        # sort the collision environments and collision max indices
+-        collision_envs, sort_indices = collision_envs.sort()
+-        collision_max_indices = collision_max_indices[sort_indices]
++        # keep whichever valid prefix is longer: already recorded data or the collision trajectory prefix.
++        env_fill_from_indices = torch.maximum(self.fill_idx[envs_to_fill], collision_max_indices[envs_to_fill]).type(
++            torch.long
++        )
+ 
+-        # filter for the environments that are not yet filled
+-        envs_to_fill = collision_envs[~self.env_buffer_filled].type(torch.long)
+-        env_fill_from_indices = collision_max_indices[~self.env_buffer_filled].type(torch.long)
++        # sort candidate source environments by how much valid trajectory they already contain.
++        source_env_pool = torch.argsort(self.fill_idx, descending=True)
++        source_env_pool = source_env_pool[self.fill_idx[source_env_pool] > 0]
++        if len(source_env_pool) == 0:
++            raise RuntimeError(
++                "Cannot backfill replay buffer because no environment collected any valid trajectory. "
++                f"{self.fill_diagnostics_str()}"
++            )
+ 
+-        # randomly select an environment to fill up the buffer from the environments that have already filled the buffer
+-        source_env_idxs = self._ALL_INDICES[
+-            self.fill_idx >= self.cfg.trajectory_length - torch.min(env_fill_from_indices)
+-        ]
+-        if source_env_idxs.shape[0] < len(envs_to_fill):
+-            print("[Warning]: Not enough environments to fill the buffer. Repeating the source environments.")
+-            repeat_times = len(envs_to_fill) // source_env_idxs.shape[0]
+-            source_env_idxs = source_env_idxs.repeat(repeat_times + 1)[: len(envs_to_fill)]
++        fallback_used = False
++        fallback_cursor = 0
+ 
+         # fill the buffer
+-        for target_env_idx, source_env_idx, collision_max_idx in zip(
+-            envs_to_fill, source_env_idxs, env_fill_from_indices
+-        ):
+-            use_until_idx = int(self.cfg.trajectory_length - collision_max_idx)
+-            self.states[target_env_idx, int(collision_max_idx) :] = self.states[source_env_idx, :use_until_idx]
+-            self.observations_proprioceptive[target_env_idx, int(collision_max_idx) :] = (
+-                self.observations_proprioceptive[source_env_idx, :use_until_idx]
++        for target_env_idx, fill_from_idx in zip(envs_to_fill.tolist(), env_fill_from_indices.tolist()):
++            remaining_len = int(self.cfg.trajectory_length - fill_from_idx)
++            if remaining_len <= 0:
++                continue
++
++            target_env_idx = int(target_env_idx)
++            fill_from_idx = int(fill_from_idx)
++
++            candidate_mask = self.fill_idx[source_env_pool] >= remaining_len
++            candidate_sources = source_env_pool[candidate_mask]
++            if len(candidate_sources) > 0:
++                source_env_idx = int(candidate_sources[fallback_cursor % len(candidate_sources)].item())
++            else:
++                if not fallback_used:
++                    print(
++                        "[WARNING]: No source environment is long enough to fill the remaining trajectory. "
++                        "Repeating the longest available partial trajectories instead."
++                    )
++                    fallback_used = True
++                source_env_idx = int(source_env_pool[fallback_cursor % len(source_env_pool)].item())
++            fallback_cursor += 1
++
++            source_valid_len = int(self.fill_idx[source_env_idx].item())
++            if source_valid_len <= 0:
++                raise RuntimeError(
++                    "Cannot backfill replay buffer because the selected source trajectory is empty. "
++                    f"target_env={target_env_idx}, source_env={source_env_idx}. {self.fill_diagnostics_str()}"
++                )
++
++            self.states[target_env_idx, fill_from_idx:] = self._repeat_source_trajectory(
++                self.states[source_env_idx], source_valid_len, remaining_len
++            )
++            self.observations_proprioceptive[target_env_idx, fill_from_idx:] = self._repeat_source_trajectory(
++                self.observations_proprioceptive[source_env_idx], source_valid_len, remaining_len
+             )
+             if self._has_exteroceptive_observation:
+-                self.observations_exteroceptive[target_env_idx, int(collision_max_idx) :] = (
+-                    self.observations_exteroceptive[source_env_idx, :use_until_idx]
++                self.observations_exteroceptive[target_env_idx, fill_from_idx:] = self._repeat_source_trajectory(
++                    self.observations_exteroceptive[source_env_idx], source_valid_len, remaining_len
+                 )
+-            self.actions[target_env_idx, int(collision_max_idx) :] = self.actions[source_env_idx, :use_until_idx]
++            self.actions[target_env_idx, fill_from_idx:] = self._repeat_source_trajectory(
++                self.actions[source_env_idx], source_valid_len, remaining_len
++            )
+             if self._has_add_exteroceptive_observation:
+-                self.add_observations_exteroceptive[target_env_idx, int(collision_max_idx) :] = (
+-                    self.add_observations_exteroceptive[source_env_idx, :use_until_idx]
++                self.add_observations_exteroceptive[target_env_idx, fill_from_idx:] = self._repeat_source_trajectory(
++                    self.add_observations_exteroceptive[source_env_idx], source_valid_len, remaining_len
+                 )
+ 
+         # update the fill index
+         self.fill_idx[envs_to_fill] = self.cfg.trajectory_length
+ 
++    def fill_diagnostics_str(self, top_k: int = 8) -> str:
++        fill_idx_cpu = self.fill_idx.detach().cpu()
++        env_step_cpu = self.env_step_counter.detach().cpu()
++        if len(fill_idx_cpu) == 0:
++            return "fill_idx stats unavailable"
++
++        top_k = min(top_k, len(fill_idx_cpu))
++        lowest_fill, lowest_envs = torch.topk(fill_idx_cpu, k=top_k, largest=False)
++        lowest_env_stats = [
++            (int(env_id), int(fill_idx), int(env_step_cpu[env_id]))
++            for env_id, fill_idx in zip(lowest_envs.tolist(), lowest_fill.tolist())
++        ]
++        return (
++            "fill_idx[min/median/max]="
++            f"{int(fill_idx_cpu.min())}/{float(fill_idx_cpu.float().median()):.1f}/{int(fill_idx_cpu.max())}, "
++            f"zero_fill_envs={int((fill_idx_cpu == 0).sum())}, "
++            f"zero_step_envs={int((env_step_cpu == 0).sum())}, "
++            f"lowest_envs(env,fill,steps)={lowest_env_stats}"
++        )
++
+     """
+     Helper functions
+     """
+@@ -309,6 +360,16 @@ class ReplayBuffer:
+         self.fill_idx = torch.zeros(self.env.num_envs, device=self.device, dtype=torch.long)
+         self.env_step_counter = torch.zeros(self.env.num_envs, device=self.device, dtype=torch.long)
+ 
++    @staticmethod
++    def _repeat_source_trajectory(source_buffer: torch.Tensor, valid_len: int, required_len: int) -> torch.Tensor:
++        source_chunk = source_buffer[:valid_len]
++        if valid_len >= required_len:
++            return source_chunk[:required_len]
++
++        repeat_times = math.ceil(required_len / valid_len)
++        repeat_shape = (repeat_times,) + (1,) * (source_chunk.ndim - 1)
++        return source_chunk.repeat(repeat_shape)[:required_len]
++
+     def _update_local_history_buffers(
+         self,
+         colliding_envs: torch.Tensor,
+diff --git a/exts/fdm/fdm/model/fdm_exteroception_model.py b/exts/fdm/fdm/model/fdm_exteroception_model.py
+index 72db6f5..3e61479 100644
+--- a/exts/fdm/fdm/model/fdm_exteroception_model.py
++++ b/exts/fdm/fdm/model/fdm_exteroception_model.py
+@@ -6,15 +6,12 @@
+ 
+ from __future__ import annotations
+ 
+-import contextlib
+ import numpy as np
+ import prettytable
+ import torch
+ import torch.nn as nn
+ from typing import TYPE_CHECKING, Any
+ 
+-import wandb
+-
+ from ..sensor_noise_models import DepthCameraNoise
+ from .model_base import Model
+ 
+@@ -204,32 +201,44 @@ class FDMExteroceptionModel(Model):
+         }
+ 
+         if mode == "eval":
+-            # get a random image index
+-            idx = torch.randint(0, target_depth_reconstruction.shape[0], (1,)).item()
+-            max_img_depth = torch.max(
+-                target_depth_reconstruction[idx].max(), pred_depth_reconstruction[idx].max()
+-            ).item()
+-            with contextlib.suppress(wandb.errors.Error):
+-                wandb.log({
+-                    "pred_images": [
+-                        wandb.Image(
+-                            (pred_depth_reconstruction[idx, :, :, img_idx].cpu().numpy() / max_img_depth * 255).astype(
+-                                np.uint8
+-                            )
+-                        )
+-                        for img_idx in range(3)
+-                    ],
+-                    "target_images": [
+-                        wandb.Image(
+-                            (
+-                                target_depth_reconstruction[idx, :, :, img_idx].cpu().numpy() / max_img_depth * 255
+-                            ).astype(np.uint8)
+-                        )
+-                        for img_idx in range(3)
+-                    ],
+-                    "pred_height_map": wandb.Image(pred_height_map[idx].cpu().numpy()),
+-                    "target_height_map": wandb.Image(target_height_map[idx].cpu().numpy()),
+-                })
++            w = getattr(self, "tb_writer", None)
++            if w is not None:
++                # get a random image index
++                idx = torch.randint(0, target_depth_reconstruction.shape[0], (1,)).item()
++                max_img_depth = torch.max(
++                    target_depth_reconstruction[idx].max(), pred_depth_reconstruction[idx].max()
++                ).item()
++                step = getattr(self, "_tb_eval_image_step", 0)
++                setattr(self, "_tb_eval_image_step", step + 1)
++                for img_idx in range(3):
++                    arr = (pred_depth_reconstruction[idx, :, :, img_idx].cpu().numpy() / max_img_depth * 255).astype(
++                        np.uint8
++                    )
++                    img_t = torch.from_numpy(arr).float() / 255.0
++                    img_t = img_t.unsqueeze(0).repeat(3, 1, 1)
++                    w.add_image(f"eval/pred_depth/{img_idx}", img_t, step)
++                    arr_t = (target_depth_reconstruction[idx, :, :, img_idx].cpu().numpy() / max_img_depth * 255).astype(
++                        np.uint8
++                    )
++                    tgt_t = torch.from_numpy(arr_t).float() / 255.0
++                    tgt_t = tgt_t.unsqueeze(0).repeat(3, 1, 1)
++                    w.add_image(f"eval/target_depth/{img_idx}", tgt_t, step)
++
++                def _height_hwc_to_chw01(h: torch.Tensor) -> torch.Tensor:
++                    arr = h.detach().cpu().numpy()
++                    if arr.ndim == 2:
++                        arr = np.stack([arr] * 3, axis=-1)
++                    elif arr.ndim == 3 and arr.shape[-1] == 1:
++                        arr = np.concatenate([arr] * 3, axis=-1)
++                    pmin, pmax = float(arr.min()), float(arr.max())
++                    if pmax > pmin:
++                        arr = (arr - pmin) / (pmax - pmin)
++                    else:
++                        arr = np.zeros_like(arr)
++                    return torch.from_numpy(arr).float().permute(2, 0, 1)
++
++                w.add_image("eval/pred_height_map", _height_hwc_to_chw01(pred_height_map[idx]), step)
++                w.add_image("eval/target_height_map", _height_hwc_to_chw01(target_height_map[idx]), step)
+ 
+         return loss, meta
+ 
+diff --git a/exts/fdm/fdm/model/fdm_model_cfg.py b/exts/fdm/fdm/model/fdm_model_cfg.py
+index 0daf3ff..a3ae3ab 100644
+--- a/exts/fdm/fdm/model/fdm_model_cfg.py
++++ b/exts/fdm/fdm/model/fdm_model_cfg.py
+@@ -144,6 +144,9 @@ class FDMBaseModelCfg(BaseModelCfg):
+     zero_collision_actions: bool = False
+     """set actions to zero if predicted that they are in collision"""
+ 
++    command_velocity_ranges: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] | None = None
++    """Optional robot-specific command velocity limits as ``((vx_min, vx_max), (vy_min, vy_max), (yaw_min, yaw_max))``."""
++
+ 
+ ###
+ # Height Scan Models
+diff --git a/exts/fdm/fdm/planner/planner.py b/exts/fdm/fdm/planner/planner.py
+index 36cc216..ce53a51 100644
+--- a/exts/fdm/fdm/planner/planner.py
++++ b/exts/fdm/fdm/planner/planner.py
+@@ -28,11 +28,14 @@ from nav_suite.terrain_analysis import TerrainAnalysis
+ 
+ from fdm.env_cfg.ui import PlannerEnvWindow
+ from fdm.mdp import GoalCommand
++from fdm.utils.configclass_patch import install_configclass_cycle_guard
+ 
+ from ..model import FDMModel, FDMModelVelocityMultiStep, FDMProprioceptionModel, FDMProprioceptionVelocityModel
+ from .planner_cfg import FDMPlannerCfg
+ from .sampling_planner import SimpleSE2TrajectoryOptimizer
+ 
++install_configclass_cycle_guard()
++
+ # can only be imported if gui activated
+ try:
+     from isaacsim.util.debug_draw import _debug_draw as omni_debug_draw
+diff --git a/exts/fdm/fdm/planner/planner_cfg.py b/exts/fdm/fdm/planner/planner_cfg.py
+index da4af8d..26ab61e 100644
+--- a/exts/fdm/fdm/planner/planner_cfg.py
++++ b/exts/fdm/fdm/planner/planner_cfg.py
+@@ -56,8 +56,8 @@ class FDMPlannerCfg:
+     If regex expression, the latest (alphabetical order) matching run will be loaded.
+     """
+ 
+-    load_checkpoint: str = "model.*.pt"
+-    """The checkpoint file to load. Default is "model.*.pt" (all).
++    load_checkpoint: str = "model.*.pth"
++    """The checkpoint file to load. Default is "model.*.pth" (all).
+ 
+     If regex expression, the latest (alphabetical order) matching file will be loaded.
+     """
+diff --git a/exts/fdm/fdm/planner/sampling_planner/planner_cfg.py b/exts/fdm/fdm/planner/sampling_planner/planner_cfg.py
+index c2d36ef..d606e37 100644
+--- a/exts/fdm/fdm/planner/sampling_planner/planner_cfg.py
++++ b/exts/fdm/fdm/planner/sampling_planner/planner_cfg.py
+@@ -10,16 +10,27 @@ from fdm import VEL_RANGE_X, VEL_RANGE_Y, VEL_RANGE_YAW
+ 
+ 
+ def get_planner_cfg(
+-    num_envs: int, traj_dim: int = 10, debug: bool = False, device: str = "cuda", population_size: int = 1024
++    num_envs: int,
++    traj_dim: int = 10,
++    debug: bool = False,
++    device: str = "cuda",
++    population_size: int = 1024,
++    lower_bound: list[float] | tuple[float, float, float] | None = None,
++    upper_bound: list[float] | tuple[float, float, float] | None = None,
+ ) -> dict:
++    if lower_bound is None:
++        lower_bound = [VEL_RANGE_X[0], VEL_RANGE_Y[0], VEL_RANGE_YAW[0]]
++    if upper_bound is None:
++        upper_bound = [VEL_RANGE_X[1], VEL_RANGE_Y[1], VEL_RANGE_YAW[1]]
++
+     cfg_dict = {
+         "traj_dim": traj_dim,
+         "action_cfg": {
+             "_target_": "fdm.planner.ActionCfg",
+             "action_dim": 3,
+             "traj_dim": traj_dim,
+-            "lower_bound": [VEL_RANGE_X[0], VEL_RANGE_Y[0], VEL_RANGE_YAW[0]],
+-            "upper_bound": [VEL_RANGE_X[1], VEL_RANGE_Y[1], VEL_RANGE_YAW[1]],
++            "lower_bound": list(lower_bound),
++            "upper_bound": list(upper_bound),
+         },
+         "to_cfg": {
+             "_target_": "fdm.planner.TrajectoryOptimizerCfg",
+diff --git a/exts/fdm/fdm/runner/runner.py b/exts/fdm/fdm/runner/runner.py
+index 11934c2..fcfc0e0 100644
+--- a/exts/fdm/fdm/runner/runner.py
++++ b/exts/fdm/fdm/runner/runner.py
+@@ -14,6 +14,7 @@ import random
+ import statistics
+ import time
+ import torch
++import yaml
+ from copy import deepcopy
+ from dataclasses import MISSING
+ from torch.utils.data import DataLoader
+@@ -23,16 +24,17 @@ import cv2
+ import hydra
+ import omegaconf
+ import pypose as pp
+-import wandb
+ 
+ import isaaclab.utils.math as math_utils
+ from isaaclab.envs import ManagerBasedRLEnv
+ from isaaclab.utils.io import dump_yaml
+ from isaaclab_tasks.utils import get_checkpoint_path
+ 
+-from fdm import LARGE_UNIFIED_HEIGHT_SCAN, PAPER_COLORS_RGBA_F, VEL_RANGE_X, VEL_RANGE_Y
++from fdm import LARGE_UNIFIED_HEIGHT_SCAN, PAPER_COLORS_RGBA_F, VEL_RANGE_X, VEL_RANGE_Y, VEL_RANGE_YAW
+ from fdm.data_buffers import ReplayBuffer
+ from fdm.utils.colors import generate_colors
++from fdm.utils.configclass_patch import install_configclass_cycle_guard
++from fdm.utils.test_dataset_paths import resolve_eval_dataset_path
+ 
+ from ..agents import MixedAgent
+ from ..model import FDMModel, FDMModelVelocityMultiStep, FDMProprioceptionModel, FDMProprioceptionVelocityModel
+@@ -40,6 +42,8 @@ from ..planner import SimpleSE2TrajectoryOptimizer, get_planner_cfg
+ from .runner_cfg import FDMRunnerCfg
+ from .trainer import Trainer
+ 
++install_configclass_cycle_guard()
++
+ # can only be imported if gui activated
+ try:
+     from isaacsim.util.debug_draw import _debug_draw as omni_debug_draw
+@@ -47,6 +51,23 @@ except ImportError:
+     omni_debug_draw = None
+ 
+ 
++def _config_dict_to_yaml_safe(obj: object) -> object:
++    # 2026-03-26 TensorBoard add_text 使用 yaml.safe_dump；配置树中可能含 slice 等不可 YAML 序列化对象，先递归转为可序列化形式
++    if obj is None or isinstance(obj, (bool, int, float, str)):
++        return obj
++    if isinstance(obj, slice):
++        return repr(obj)
++    if isinstance(obj, dict):
++        return {str(k): _config_dict_to_yaml_safe(v) for k, v in obj.items()}
++    if isinstance(obj, (list, tuple)):
++        return [_config_dict_to_yaml_safe(x) for x in obj]
++    if isinstance(obj, np.ndarray):
++        return obj.tolist() if obj.size <= 4096 else repr(obj)
++    if isinstance(obj, np.generic):
++        return obj.item()
++    return repr(obj)
++
++
+ class FDMRunner:
+     def __init__(self, cfg: FDMRunnerCfg, args_cli, eval: bool = False, render_mode: str | None = None):
+         self.cfg = cfg
+@@ -60,6 +81,7 @@ class FDMRunner:
+ 
+         # update cfg
+         self.cfg.env_cfg.scene.num_envs = self.args_cli.num_envs
++        self.cfg.trainer_cfg.test_dataset_robot = self.args_cli.robot.lower()
+         if hasattr(args_cli, "run_name"):
+             self.cfg.trainer_cfg.run_name = (
+                 self.cfg.trainer_cfg.run_name + self.args_cli.run_name
+@@ -121,6 +143,15 @@ class FDMRunner:
+         """The device to use for training."""
+         return self.env.device
+ 
++    @property
++    def command_velocity_ranges(self) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
++        """Robot-specific command velocity ranges, falling back to the global defaults."""
++        return getattr(
++            self.cfg.model_cfg,
++            "command_velocity_ranges",
++            (VEL_RANGE_X, VEL_RANGE_Y, VEL_RANGE_YAW),
++        )
++
+     """
+     Operations
+     """
+@@ -161,12 +192,20 @@ class FDMRunner:
+         else:
+             self.agent = None
+ 
+-        # add entire config to wandb
+         if not self.eval and self.cfg.trainer_cfg.logging:
+             save_cfg = deepcopy(self.cfg).to_dict()
+             dump_yaml(filename=f"{self.trainer.log_dir}/params/config.yaml", data=save_cfg)
+             save_cfg.pop("trainer_cfg")
+-            wandb.config.update(save_cfg)
++            tw = getattr(self.trainer, "tb_writer", None)
++            if tw is not None:
++                try:
++                    cfg_safe = _config_dict_to_yaml_safe(save_cfg)
++                    cfg_str = yaml.safe_dump(cfg_safe, default_flow_style=False, allow_unicode=True)
++                    if len(cfg_str) > 15000:
++                        cfg_str = cfg_str[:15000] + "\n... [truncated]"
++                    tw.add_text("runner/config", cfg_str, 0)
++                except Exception as exc:
++                    print(f"[WARNING] Could not log runner config to TensorBoard: {exc}")
+ 
+         # setup buffers
+         self.feet_idx, _ = self.env.scene.sensors["contact_forces"].find_bodies(self.cfg.body_regex_contact_checking)
+@@ -247,11 +286,11 @@ class FDMRunner:
+                 else:
+                     suffix = "_baseline"
+             if LARGE_UNIFIED_HEIGHT_SCAN:
+-                suffix += "_largeHeightScan"
++                suffix += "_largeUnifiedHeightScan"
+             if hasattr(self.args_cli, "ablation_mode") and self.args_cli.ablation_mode is not None:
+                 suffix += f"_ablation_{self.args_cli.ablation_mode}"
+ 
+-            eval_dataset_path = os.path.join(log_dir, "test_datasets", f"{terrain_name}{suffix}_dataset.pkl")
++            eval_dataset_path = resolve_eval_dataset_path(log_dir, self.args_cli.robot, terrain_name, suffix)
+ 
+             if not os.path.isfile(eval_dataset_path):
+                 self._collect(eval=False)
+@@ -545,9 +584,10 @@ class FDMRunner:
+         actions = self.agent.reset(obs)
+ 
+         if hasattr(self.args_cli, "max_actions") and self.args_cli.max_actions:
++            vel_range_x, vel_range_y, _ = self.command_velocity_ranges
+             max_actions = torch.zeros_like(actions)
+-            max_actions[:, 0] = VEL_RANGE_X[1]
+-            max_actions[:, 1] = VEL_RANGE_Y[1]
++            max_actions[:, 0] = vel_range_x[1]
++            max_actions[:, 1] = vel_range_y[1]
+ 
+         # make actions equal in the case of an equal agent
+         if self.args_cli.equal_actions:
+@@ -875,7 +915,12 @@ class FDMRunner:
+             obs, _ = self.env.reset(random.randint(0, 1000000))
+             # the contact sensor is delayed, execute delay+1 steps to reset all environments correctly
+             if torch.any(obs["fdm_state"][..., 7]):
+-                for _ in range(self.cfg.env_cfg.scene.contact_forces.history_length - self.cfg.env_cfg.decimation + 1):
++                dones = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.env.device)
++                flush_steps = max(
++                    1,
++                    self.cfg.env_cfg.scene.contact_forces.history_length - self.cfg.env_cfg.decimation + 1,
++                )
++                for _ in range(flush_steps):
+                     obs, _, dones, _, _ = self.env.step(torch.zeros(self.env.num_envs, 3, device=self.env.device))
+                 if dones.sum() != 0:
+                     carb.log_warn("Environments should not be done after reset.")
+@@ -1003,6 +1048,7 @@ class FDMRunner:
+                 and plan_time + sim_time + process_time > 1.5 * np.mean(collect_time)
+             ):
+                 print("[WARNING]: Collection took too long for some environments. Stopping collection.")
++                print(f"[WARNING]: Replay buffer diagnostics before backfill: {self.replay_buffer.fill_diagnostics_str()}")
+                 self.replay_buffer.fill_leftover_envs()
+                 break
+ 
+@@ -1134,9 +1180,10 @@ class FDMRunner:
+                 dim=1,
+             ).to(self.device)
+         elif hasattr(self.args_cli, "max_actions") and self.args_cli.max_actions:
++            vel_range_x, vel_range_y, _ = self.command_velocity_ranges
+             future_actions = torch.zeros(env_ids.shape[0], self.cfg.model_cfg.prediction_horizon, 3).to(self.device)
+-            future_actions[:, :, 0] = VEL_RANGE_X[1]
+-            future_actions[:, :, 1] = VEL_RANGE_Y[1]
++            future_actions[:, :, 0] = vel_range_x[1]
++            future_actions[:, :, 1] = vel_range_y[1]
+         else:
+             future_actions = torch.concatenate(
+                 [
+diff --git a/exts/fdm/fdm/runner/trainer/trainer.py b/exts/fdm/fdm/runner/trainer/trainer.py
+index 3c3810b..02be566 100644
+--- a/exts/fdm/fdm/runner/trainer/trainer.py
++++ b/exts/fdm/fdm/runner/trainer/trainer.py
+@@ -14,8 +14,7 @@ import torch
+ import torch.optim as optim
+ from prettytable import PrettyTable
+ from torch.utils.data import ConcatDataset, DataLoader
+-
+-import wandb
++from torch.utils.tensorboard.writer import SummaryWriter
+ 
+ from isaaclab.utils.io import dump_yaml
+ from isaaclab.utils.noise import NoiseCfg
+@@ -23,12 +22,25 @@ from isaaclab_tasks.utils import get_checkpoint_path
+ 
+ from fdm.data_buffers import ReplayBufferCfg, TrajectoryDataset
+ from fdm.model import EmpiricalNormalization, FDMModel
++from fdm.utils.test_dataset_paths import resolve_static_test_dataset_path
+ 
+ from .early_stopping import EarlyStopping
+ from .trainer_cfg import TrainerBaseCfg
+ from .utils import combined_dataloader
+ 
+ 
++def _tb_sanitize_tag(name: str) -> str:
++    return name.replace(" ", "_").replace("[", "").replace("]", "")
++
++
++def _tb_log_scalars(writer: SummaryWriter, data: dict, step: int, prefix: str = "") -> None:
++    for k, v in data.items():
++        if not isinstance(v, (int, float)):
++            continue
++        tag = f"{prefix}/{_tb_sanitize_tag(k)}" if prefix else _tb_sanitize_tag(k)
++        writer.add_scalar(tag, float(v), step)
++
++
+ class Trainer:
+     def __init__(
+         self,
+@@ -46,6 +58,7 @@ class Trainer:
+         self.device = device
+         self.eval = eval
+         self.model = model
++        self.tb_writer: SummaryWriter | None = None
+ 
+         # init logging dir (also used for loading checkpoints)
+         self._init_looging_dir()
+@@ -150,9 +163,9 @@ class Trainer:
+ 
+             self.test_datasets = {}
+             for test_dataset_path in self.cfg.test_datasets:
+-                # if {LOG_DIR} is in the path, replace it with the current log directory
+-                log_dir_path = os.path.split(self.log_root_path)[0]
+-                test_dataset_path = test_dataset_path.replace("{LOG_DIR}", log_dir_path)
++                test_dataset_path = resolve_static_test_dataset_path(
++                    test_dataset_path, self.log_root_path, self.cfg.test_dataset_robot
++                )
+ 
+                 if not os.path.isfile(test_dataset_path):
+                     print(f"[WARNING] Test Dataset {test_dataset_path} not found! Will proceed without!")
+@@ -167,6 +180,8 @@ class Trainer:
+                         num_workers=self.cfg.num_workers,
+                         pin_memory=True,
+                     )
++            if not self.test_datasets:
++                self.test_datasets = None
+         else:
+             self.test_datasets = None
+ 
+@@ -192,13 +207,16 @@ class Trainer:
+                 with open(real_world_train_dataset_path, "rb") as real_world_train_dataset:
+                     real_world_train_datasets.append(pickle.load(real_world_train_dataset))
+ 
+-            self.real_world_train_datasets = DataLoader(
+-                ConcatDataset(real_world_train_datasets),
+-                batch_size=self.cfg.batch_size,
+-                shuffle=False,
+-                num_workers=self.cfg.num_workers,
+-                pin_memory=True,
+-            )
++            if real_world_train_datasets:
++                self.real_world_train_datasets = DataLoader(
++                    ConcatDataset(real_world_train_datasets),
++                    batch_size=self.cfg.batch_size,
++                    shuffle=False,
++                    num_workers=self.cfg.num_workers,
++                    pin_memory=True,
++                )
++            else:
++                self.real_world_train_datasets = None
+         else:
+             self.real_world_train_datasets = None
+ 
+@@ -228,6 +246,8 @@ class Trainer:
+                         num_workers=self.cfg.num_workers,
+                         pin_memory=True,
+                     )
++            if not self.real_world_test_datasets:
++                self.real_world_test_datasets = None
+         else:
+             self.real_world_test_datasets = None
+ 
+@@ -243,11 +263,11 @@ class Trainer:
+         epoch_mean_loss = 0
+         epoch_mean_val_loss = 0
+         if self.test_datasets:
+-            batch_number_test = sum([len(train_dataloader) for train_dataloader in self.test_datasets])
++            batch_number_test = sum(len(test_dataloader) for test_dataloader in self.test_datasets.values())
+             epoch_mean_test_loss = 0
+         if self.real_world_test_datasets:
+             batch_number_real_world_test = sum(
+-                [len(real_world_test_dataloader) for real_world_test_dataloader in self.real_world_test_datasets]
++                len(real_world_test_dataloader) for real_world_test_dataloader in self.real_world_test_datasets.values()
+             )
+             epoch_mean_real_world_test_loss = 0
+ 
+@@ -256,8 +276,9 @@ class Trainer:
+             self.early_stopping.reset()
+ 
+         # log collection epoch
+-        if self.cfg.logging:
+-            wandb.log({"Collection Round": collection_round})
++        if self.cfg.logging and self.tb_writer is not None:
++            cr = float(collection_round) if collection_round is not None else -1.0
++            _tb_log_scalars(self.tb_writer, {"Collection_Round": cr}, self.batch_counter)
+ 
+         for epoch in range(self.cfg.epochs):
+             # buffer variable reset each epoch
+@@ -289,8 +310,8 @@ class Trainer:
+                 )
+                 mean_loss += loss
+ 
+-                if self.cfg.logging:
+-                    wandb.log(meta, step=self.batch_counter)
++                if self.cfg.logging and self.tb_writer is not None:
++                    _tb_log_scalars(self.tb_writer, meta, self.batch_counter)
+                     self.batch_counter += 1
+             # get mean training loss
+             mean_loss = mean_loss / batch_number_train
+@@ -357,25 +378,25 @@ class Trainer:
+                 mean_real_world_test_loss = mean_real_world_test_loss / batch_number_real_world_test
+                 epoch_mean_real_world_test_loss += mean_real_world_test_loss
+                 for key, value in real_world_test_meta.items():
+-                    real_world_test_meta[key] = value / len(real_world_test_dataloader)
+-
+-            if self.cfg.logging:
+-                wandb.log(
+-                    {
+-                        "train Loss [Epoch]": mean_loss,
+-                        "eval Loss [Epoch]": mean_val_loss,
+-                        "learning rate": self.optimizer.param_groups[0]["lr"],
+-                    }
+-                    | eval_meta,
+-                    step=self.batch_counter,
+-                )
++                    real_world_test_meta[key] = value / batch_number_real_world_test
++
++            if self.cfg.logging and self.tb_writer is not None:
++                epoch_scalars = {
++                    "train_Loss_Epoch": mean_loss,
++                    "eval_Loss_Epoch": mean_val_loss,
++                    "learning_rate": self.optimizer.param_groups[0]["lr"],
++                } | eval_meta
++                _tb_log_scalars(self.tb_writer, epoch_scalars, self.batch_counter)
+ 
+                 if self.test_datasets:
+-                    wandb.log({"test_loss [Epoch]": mean_test_loss} | test_meta, step=self.batch_counter)
++                    _tb_log_scalars(
++                        self.tb_writer, {"test_loss_Epoch": mean_test_loss} | test_meta, self.batch_counter
++                    )
+                 if self.real_world_test_datasets:
+-                    wandb.log(
+-                        {"real_world_test_loss [Epoch]": mean_real_world_test_loss} | real_world_test_meta,
+-                        step=self.batch_counter,
++                    _tb_log_scalars(
++                        self.tb_writer,
++                        {"real_world_test_loss_Epoch": mean_real_world_test_loss} | real_world_test_meta,
++                        self.batch_counter,
+                     )
+ 
+             # print a description string
+@@ -442,6 +463,9 @@ class Trainer:
+         epoch_mean_loss = epoch_mean_loss / self.cfg.epochs
+         epoch_mean_val_loss = epoch_mean_val_loss / self.cfg.epochs
+ 
++        if self.tb_writer is not None:
++            self.tb_writer.flush()
++
+         return epoch_mean_loss, epoch_mean_val_loss
+ 
+     def evaluate(self, dataloader: DataLoader | None = None, plot_mode: bool = False) -> tuple[dict, dict]:
+@@ -451,7 +475,7 @@ class Trainer:
+         mean_eval_loss = 0
+         meta_eval = {}
+         if self.test_datasets:
+-            batch_number_test = sum([len(train_dataloader) for train_dataloader in self.test_datasets])
++            batch_number_test = sum(len(test_dataloader) for test_dataloader in self.test_datasets.values())
+             mean_test_loss = 0
+ 
+         if dataloader is None:
+@@ -548,29 +572,12 @@ class Trainer:
+         # dump the configuration into log-directory
+         dump_yaml(os.path.join(self.log_dir, "params", "trainer_cfg.yaml"), self.cfg)
+ 
+-        # init wandb logging
+         if self.cfg.logging:
+-            # Use environment variables for wandb configuration
+-            wb_entity = self.cfg.wb_entity or os.getenv("WANDB_ENTITY")
+-            wb_mode = self.cfg.wb_mode or os.getenv("WANDB_MODE", "online")
+-            wb_api_key = os.getenv("WANDB_API_KEY")
+-
+-            if not wb_api_key:
+-                print("[WARNING] WANDB_API_KEY environment variable not set. Wandb logging will be disabled.")
+-                return
+-
+-            try:
+-                wandb.init(
+-                    project=self.cfg.experiment_name,
+-                    entity=wb_entity,
+-                    name=log_name,
+-                    config=self.cfg.to_dict(),
+-                    dir=self.log_dir,
+-                    mode=wb_mode,
+-                )
+-                wandb.watch(self.model)
+-            except:  # noqa: E722
+-                print("[WARNING: Wandb not available")
++            tb_dir = os.path.join(self.log_dir, "tensorboard")
++            os.makedirs(tb_dir, exist_ok=True)
++            self.tb_writer = SummaryWriter(log_dir=tb_dir)
++            print(f"[INFO] TensorBoard log directory: {tb_dir}")
++            setattr(self.model, "tb_writer", self.tb_writer)
+ 
+     def _obs_noise(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
+         """Apply noise to the exteroceptive observations."""
+diff --git a/exts/fdm/fdm/runner/trainer/trainer_cfg.py b/exts/fdm/fdm/runner/trainer/trainer_cfg.py
+index 2b0f9e3..e384fc7 100644
+--- a/exts/fdm/fdm/runner/trainer/trainer_cfg.py
++++ b/exts/fdm/fdm/runner/trainer/trainer_cfg.py
+@@ -36,12 +36,14 @@ class TrainerBaseCfg:
+     """Batch size for training."""
+     collision_rate: float | None = None  # 0.4
+     """Rate of samples that are in collision."""
++    test_dataset_robot: str = "anymal"
++    """Robot name used to resolve robot-scoped test dataset paths."""
+     # test_datasets: str | list[str] | None = None
+     test_datasets: str | list[str] | None = [
+-        "{LOG_DIR}/test_datasets/plane.pkl",
+-        "{LOG_DIR}/test_datasets/PILLAR_EVAL_CFG.pkl",
+-        "{LOG_DIR}/test_datasets/STAIRS_WALL_EVAL_CFG.pkl",
+-        "{LOG_DIR}/test_datasets/STAIRS_RAMP_EVAL_CFG.pkl",
++        "{LOG_DIR}/test_datasets/{ROBOT}/plane.pkl",
++        "{LOG_DIR}/test_datasets/{ROBOT}/PILLAR_EVAL_CFG.pkl",
++        "{LOG_DIR}/test_datasets/{ROBOT}/STAIRS_WALL_EVAL_CFG.pkl",
++        "{LOG_DIR}/test_datasets/{ROBOT}/STAIRS_RAMP_EVAL_CFG.pkl",
+     ]
+     """Static Test Datasets collected from different environments"""
+     real_world_train_datasets: str | list[str] | None = None
+@@ -83,9 +85,9 @@ class TrainerBaseCfg:
+     run_name: str | None = None
+     """Name of the run."""
+     wb_entity: str | None = None
+-    """Wandb entity name. If None, will use WANDB_ENTITY environment variable."""
++    """Deprecated (unused). Training logs to TensorBoard under each run's ``tensorboard/`` directory."""
+     wb_mode: str | None = None
+-    """Wandb mode. If None, will use WANDB_MODE environment variable."""
++    """Deprecated (unused)."""
+ 
+     # resume and load checkpoint
+     resume: bool = False
+@@ -102,8 +104,8 @@ class TrainerBaseCfg:
+ 
+     If regex expression, the latest (alphabetical order) matching run will be loaded.
+     """
+-    load_checkpoint: str = "model.*.pt"
+-    """The checkpoint file to load. Default is "model.*.pt" (all).
++    load_checkpoint: str = "model.*.pth"
++    """The checkpoint file to load. Default is "model.*.pth" (all).
+ 
+     If regex expression, the latest (alphabetical order) matching file will be loaded.
+     """
+diff --git a/exts/fdm/fdm/utils/args_cli_utils.py b/exts/fdm/fdm/utils/args_cli_utils.py
+index 1263854..c1b25d8 100644
+--- a/exts/fdm/fdm/utils/args_cli_utils.py
++++ b/exts/fdm/fdm/utils/args_cli_utils.py
+@@ -29,6 +29,25 @@ Configuration initialization.
+ """
+ 
+ 
++def _set_agent_command_velocity_ranges(agent_cfg, vel_ranges: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]):
++    """Recursively apply command velocity ranges to agent configs that expose ``ranges``."""
++    if hasattr(agent_cfg, "terms"):
++        for term in agent_cfg.terms.values():
++            _set_agent_command_velocity_ranges(term.agent_term, vel_ranges)
++
++    if hasattr(agent_cfg, "ranges"):
++        agent_cfg.ranges.lin_vel_x = vel_ranges[0]
++        agent_cfg.ranges.lin_vel_y = vel_ranges[1]
++        agent_cfg.ranges.ang_vel_z = vel_ranges[2]
++
++
++def _apply_robot_specific_command_velocity_ranges(cfg, vel_ranges):
++    """Keep command velocity limits robot-specific instead of relying on the global defaults."""
++    cfg.model_cfg.command_velocity_ranges = vel_ranges
++    if isinstance(cfg, fdm_runner.FDMRunnerCfg):
++        _set_agent_command_velocity_ranges(cfg.agent_cfg, vel_ranges)
++
++
+ def runner_cfg_init(args_cli) -> fdm_runner.FDMRunnerCfg:
+     # check if any planner mode is enabled
+     if PLANNER_MODE or PLANNER_MODE_BASELINE:
+@@ -100,9 +119,6 @@ def robot_changes(
+         if isinstance(cfg, fdm_runner.FDMRunnerCfg):
+             cfg.trainer_cfg.encoder_resume = None
+ 
+-        # NOTE: remove when test datasets are available
+-        cfg.trainer_cfg.test_datasets = None
+-
+     # Tytan quiet
+     elif args_cli.robot.lower() == "tytan_quiet":
+         print("[INFO] Tytan quiet")
+@@ -117,9 +133,6 @@ def robot_changes(
+         if isinstance(cfg, fdm_runner.FDMRunnerCfg):
+             cfg.trainer_cfg.encoder_resume = None
+ 
+-        # NOTE: remove when test datasets are available
+-        cfg.trainer_cfg.test_datasets = None
+-
+     # Anymal on wheels (AOW)
+     elif args_cli.robot.lower() == "aow":
+         print("[INFO] Anymal on wheels (AOW)")
+@@ -135,8 +148,24 @@ def robot_changes(
+         if isinstance(cfg, fdm_runner.FDMRunnerCfg):
+             cfg.trainer_cfg.encoder_resume = None
+ 
+-        # NOTE: remove when test datasets are available
+-        cfg.trainer_cfg.test_datasets = None
++    # D5
++    elif args_cli.robot.lower() == "d5":
++        print("[INFO] D5")
++        cfg.env_cfg = env_robot_cfg.d5_env(cfg.env_cfg, args_cli.env)
++        cfg.model_cfg = model_robot_cfg.d5_model(cfg.model_cfg, args_cli.env)
++        cfg.body_regex_contact_checking = env_robot_cfg.D5_GROUND_CONTACT_BODY_REGEX
++        _apply_robot_specific_command_velocity_ranges(
++            cfg,
++            (
++                env_robot_cfg.D5_CMD_VEL_RANGE_X,
++                env_robot_cfg.D5_CMD_VEL_RANGE_Y,
++                env_robot_cfg.D5_CMD_VEL_RANGE_YAW,
++            ),
++        )
++
++        # currently cancel out all the pre-trained models
++        if isinstance(cfg, fdm_runner.FDMRunnerCfg):
++            cfg.trainer_cfg.encoder_resume = None
+ 
+     # ANYmal with perceptive walking policy
+     elif args_cli.robot.lower() == "anymal_perceptive":
+@@ -181,6 +210,15 @@ def cfg_modifier_pre_init(  # noqa: C901
+         else:
+             print("[WARNING] Occlusions are not supported for the current environment")
+ 
++    if (
++        hasattr(args_cli, "env")
++        and args_cli.env == "height"
++        and hasattr(args_cli, "robot")
++        and args_cli.robot.lower() == "d5"
++        and hasattr(cfg.env_cfg.observations.fdm_obs_exteroceptive, "env_sensor")
++    ):
++        cfg.env_cfg.observations.fdm_obs_exteroceptive.env_sensor.params["shape"] = env_robot_cfg.D5_HEIGHT_SCAN_SHAPE
++
+     # add noise to observations
+     if hasattr(args_cli, "noise") and args_cli.noise:
+ 
+@@ -252,7 +290,7 @@ def cfg_modifier_pre_init(  # noqa: C901
+ 
+         if hasattr(args_cli, "remove_torque") and args_cli.remove_torque:
+             cfg.env_cfg.observations.fdm_obs_proprioception.joint_torque = None
+-            if args_cli.robot.lower() == "aow":
++            if args_cli.robot.lower() == "aow" or args_cli.robot.lower() == "d5":
+                 cfg.model_cfg.state_obs_proprioception_encoder.input_size -= 16
+                 cfg.model_cfg.empirical_normalization_dim -= 16
+             else:
+@@ -275,7 +313,7 @@ def cfg_modifier_pre_init(  # noqa: C901
+                 cfg.trainer_cfg.test_datasets = [
+                     f"{dataset[:-4]}_noise.pkl" for dataset in cfg.trainer_cfg.test_datasets
+                 ]
+-            elif hasattr(args_cli, "occlusion") and args_cli.occlusion:
++            elif hasattr(args_cli, "occlusions") and args_cli.occlusions:
+                 cfg.trainer_cfg.test_datasets = [
+                     f"{dataset[:-4]}_occlusions.pkl" for dataset in cfg.trainer_cfg.test_datasets
+                 ]
+diff --git a/exts/fdm/fdm/utils/model_comp_plot.py b/exts/fdm/fdm/utils/model_comp_plot.py
+index fcde49b..f627b8e 100644
+--- a/exts/fdm/fdm/utils/model_comp_plot.py
++++ b/exts/fdm/fdm/utils/model_comp_plot.py
+@@ -5,6 +5,7 @@
+ # SPDX-License-Identifier: BSD-3-Clause
+ 
+ import math
++import shutil
+ 
+ # avoid to use type 3 fonts
+ import matplotlib
+@@ -28,7 +29,7 @@ from isaaclab.sensors import RayCasterCfg
+ from fdm import PAPER_COLORS_HEX, PAPER_COLORS_RGB_F, PAPER_COLORS_RGBA_F, VEL_RANGE_X, VEL_RANGE_Y, VEL_RANGE_YAW
+ from fdm.model import FDMModel
+ 
+-matplotlib.rcParams["text.usetex"] = True
++matplotlib.rcParams["text.usetex"] = shutil.which("latex") is not None
+ 
+ 
+ def fill_nearest_neighbor(height_map, unknown_value=1.5):
+@@ -1089,7 +1090,7 @@ class ViolinPlotter:
+                         linthresh = 1
+                         ax.set_yscale("symlog", linthresh=linthresh)
+ 
+-                    if col_idx == 0:
++                    if col_idx == 0 and log_scale:
+                         # Add custom labels for "linear" and "logarithmic"
+                         axes[row_idx, col_idx].annotate(
+                             "linear",
+@@ -1123,6 +1124,10 @@ class ViolinPlotter:
+             fig.savefig(os.path.join(save_path, f"{prefix}violin_plot_step{step}{suffix}.pdf"), dpi=300)
+             plt.close(fig)
+ 
++        # The combined comparison plots below are only meaningful when multiple models are shown.
++        if len(self.models) == 1:
++            return
++
+         # If there are two steps, create a combined violin plot with hue differentiation
+         if len(self.steps) == 2:
+             # Number of rows = 3 (Position delta, Collision, Non-collision) if collision_split is True else 1 (position delta)
+@@ -1249,6 +1254,7 @@ class ViolinPlotter:
+                             x_offset_factor = 3.1
+                         else:
+                             color = "#000000"  # Default color if no match is found
++                            x_offset_factor = 2.0
+ 
+                         # Measure the width of the label
+                         bbox = label.get_window_extent(renderer=renderer)
+@@ -1302,31 +1308,31 @@ class ViolinPlotter:
+                         linthresh = 1
+                         ax.set_yscale("symlog", linthresh=linthresh)
+ 
+-                if col_idx == 0:
+-                    # Add custom labels for "linear" and "logarithmic"
+-                    axes[row_idx, col_idx].annotate(
+-                        "linear",
+-                        xy=(0, linthresh / 2),  # Position halfway between 0 and linthresh
+-                        xytext=(-65, 0),  # Adjust label alignment to match the axis
+-                        textcoords="offset points",
+-                        rotation=90,
+-                        ha="center",
+-                        va="center",
+-                        fontsize=10,
+-                        color="black",
+-                    )
++                    if col_idx == 0 and log_scale:
++                        # Add custom labels for "linear" and "logarithmic"
++                        axes[row_idx, col_idx].annotate(
++                            "linear",
++                            xy=(0, linthresh / 2),  # Position halfway between 0 and linthresh
++                            xytext=(-65, 0),  # Adjust label alignment to match the axis
++                            textcoords="offset points",
++                            rotation=90,
++                            ha="center",
++                            va="center",
++                            fontsize=10,
++                            color="black",
++                        )
+ 
+-                    axes[row_idx, col_idx].annotate(
+-                        "logarithmic",
+-                        xy=(0, linthresh * 2),  # Position above linthresh in the logarithmic region
+-                        xytext=(-65, 0),  # Adjust label alignment
+-                        textcoords="offset points",
+-                        rotation=90,
+-                        ha="center",
+-                        va="center",
+-                        fontsize=10,
+-                        color="black",
+-                    )
++                        axes[row_idx, col_idx].annotate(
++                            "logarithmic",
++                            xy=(0, linthresh * 2),  # Position above linthresh in the logarithmic region
++                            xytext=(-65, 0),  # Adjust label alignment
++                            textcoords="offset points",
++                            rotation=90,
++                            ha="center",
++                            va="center",
++                            fontsize=10,
++                            color="black",
++                        )
+ 
+             # Adjust layout
+             plt.tight_layout()
+diff --git a/exts/fdm/setup.py b/exts/fdm/setup.py
+index db650b2..721c2c6 100644
+--- a/exts/fdm/setup.py
++++ b/exts/fdm/setup.py
+@@ -24,6 +24,7 @@ INSTALL_REQUIRES = [
+     "kornia",
+     "seaborn",
+     "tabulate",
++    "tensorboard",
+ ]
+ 
+ # Installation operation
+diff --git a/scripts/convenience/plan_test_metric.sh b/scripts/convenience/plan_test_metric.sh
+index 53f3dab..99fdbbc 100755
+--- a/scripts/convenience/plan_test_metric.sh
++++ b/scripts/convenience/plan_test_metric.sh
+@@ -19,7 +19,7 @@ ${ISAACLAB_HOME}/isaaclab.sh -p ${ISAACLAB_HOME}/fdm_sub/scripts/plan_test.py \
+     --run ${MODEL_FDM} \
+     --mode metric \
+     --env_type 2D \
+-    --reduced_obs --occlusion --remove_torque
++    --reduced_obs --occlusions --remove_torque
+ 
+ # ${ISAACLAB_HOME}/isaaclab.sh -p ${ISAACLAB_HOME}/fdm_sub/scripts/plan_test.py \
+ #     --run ${BASELINE_FDM_MODEL} --env baseline \
+@@ -30,7 +30,7 @@ ${ISAACLAB_HOME}/isaaclab.sh -p ${ISAACLAB_HOME}/fdm_sub/scripts/plan_test.py \
+ #     --run ${MODEL_FDM} --env heuristic \
+ #     --mode metric \
+ #     --env_type 2D \
+-#     --reduced_obs --occlusion --remove_torque
++#     --reduced_obs --occlusions --remove_torque
+ 
+ ###
+ # 3D Environment
+@@ -40,7 +40,7 @@ ${ISAACLAB_HOME}/isaaclab.sh -p ${ISAACLAB_HOME}/fdm_sub/scripts/plan_test.py \
+     --run ${MODEL_FDM} \
+     --mode metric \
+     --env_type 3D \
+-    --reduced_obs --occlusion --remove_torque
++    --reduced_obs --occlusions --remove_torque
+ 
+ # ${ISAACLAB_HOME}/isaaclab.sh -p ${ISAACLAB_HOME}/fdm_sub/scripts/plan_test.py \
+ #     --run ${BASELINE_FDM_MODEL} --env baseline \
+@@ -51,4 +51,4 @@ ${ISAACLAB_HOME}/isaaclab.sh -p ${ISAACLAB_HOME}/fdm_sub/scripts/plan_test.py \
+ #     --run ${MODEL_FDM} --env heuristic \
+ #     --mode metric \
+ #     --env_type 3D \
+-#     --reduced_obs --occlusion --remove_torque
++#     --reduced_obs --occlusions --remove_torque
+diff --git a/scripts/convenience/plan_test_plot.sh b/scripts/convenience/plan_test_plot.sh
+index 173b89d..9f73cc0 100755
+--- a/scripts/convenience/plan_test_plot.sh
++++ b/scripts/convenience/plan_test_plot.sh
+@@ -7,46 +7,46 @@ ISAACLAB_HOME=/home/pascalr/orbit/IsaacLab
+ # ${ISAACLAB_HOME}/isaaclab.sh -p ${ISAACLAB_HOME}/fdm_sub/scripts/plan_test.py \
+ #     --mode plot \
+ #     --cost_show "Cost" \
+-#     --occlusion
++#     --occlusions
+ 
+ # ${ISAACLAB_HOME}/isaaclab.sh -p ${ISAACLAB_HOME}/fdm_sub/scripts/plan_test.py \
+ #     --mode plot \
+ #     --cost_show "Goal_Distance"  \
+-#     --occlusion
++#     --occlusions
+ 
+ # ${ISAACLAB_HOME}/isaaclab.sh -p ${ISAACLAB_HOME}/fdm_sub/scripts/plan_test.py \
+ #     --mode plot \
+ #     --cost_show "Collision" \
+-#     --occlusion
++#     --occlusions
+ 
+ # ${ISAACLAB_HOME}/isaaclab.sh -p ${ISAACLAB_HOME}/fdm_sub/scripts/plan_test.py \
+ #     --mode plot \
+ #     --cost_show "Pose_Reward" \
+-#     --occlusion
++#     --occlusions
+ 
+ # ${ISAACLAB_HOME}/isaaclab.sh -p ${ISAACLAB_HOME}/fdm_sub/scripts/plan_test.py \
+ #     --mode plot \
+ #     --cost_show "Cost" \
+ #     --env heuristic \
+-#     --occlusion
++#     --occlusions
+ 
+ # ${ISAACLAB_HOME}/isaaclab.sh -p ${ISAACLAB_HOME}/fdm_sub/scripts/plan_test.py \
+ #     --mode plot \
+ #     --cost_show "Goal_Distance" \
+ #     --env heuristic \
+-#     --occlusion
++#     --occlusions
+ 
+ # ${ISAACLAB_HOME}/isaaclab.sh -p ${ISAACLAB_HOME}/fdm_sub/scripts/plan_test.py \
+ #     --mode plot \
+ #     --cost_show "Height_Scan_Cost" \
+ #     --env heuristic \
+-#     --occlusion
++#     --occlusions
+ 
+ # ${ISAACLAB_HOME}/isaaclab.sh -p ${ISAACLAB_HOME}/fdm_sub/scripts/plan_test.py \
+ #     --mode plot \
+ #     --cost_show "Pose_Reward" \
+ #     --env heuristic \
+-#     --occlusion
++#     --occlusions
+ 
+ 
+ ## VIDEO
+@@ -54,4 +54,4 @@ ISAACLAB_HOME=/home/pascalr/orbit/IsaacLab
+ ${ISAACLAB_HOME}/isaaclab.sh -p ${ISAACLAB_HOME}/fdm_sub/scripts/plan_test.py \
+     --mode plot_video \
+     --cost_show "Cost" \
+-    --occlusion
++    --occlusions
+diff --git a/scripts/eval_metrics.py b/scripts/eval_metrics.py
+index 776a214..1b497f2 100644
+--- a/scripts/eval_metrics.py
++++ b/scripts/eval_metrics.py
+@@ -46,12 +46,9 @@ simulation_app = app_launcher.app
+ 
+ """Rest everything follows."""
+ 
+-import numpy as np
+ import os
+ import torch
+ 
+-import omni
+-
+ import fdm.runner as fdm_runner_cfg
+ from fdm.utils.args_cli_utils import (
+     ablation_studies_modifications,
+@@ -91,54 +88,6 @@ def load_cfg():
+     return cfg
+ 
+ 
+-def combine_dicts(dicts):
+-    # Combine data
+-    combined_dict = {}
+-    combined_dict_count = {}
+-
+-    for curr_dict in dicts:
+-        for env, meta_dict in curr_dict.items():
+-            if env not in combined_dict:
+-                combined_dict[env] = {}
+-                combined_dict_count[env] = {}
+-            for metric, values in meta_dict.items():
+-                if "Perfect Velocity" in metric:
+-                    metric = metric.removeprefix("baseline ")
+-
+-                if metric not in combined_dict[env]:
+-                    combined_dict[env][metric] = {"x": values["x"], "y": values["y"], "std": values["std"]}
+-                    combined_dict_count[env][metric] = {
+-                        "y_sum": 1,
+-                        "std_count": 0 if np.any(np.array(values["std"]) is None) else 1,
+-                    }
+-                else:
+-                    combined_dict[env][metric]["y"] = list(np.add(combined_dict[env][metric]["y"], values["y"]))
+-                    combined_dict_count[env][metric]["y_sum"] += 1
+-                    if not np.any(np.array(combined_dict[env][metric]["std"]) is None) and not np.any(
+-                        np.array(values["std"]) is None
+-                    ):
+-                        combined_dict[env][metric]["std"] = list(
+-                            np.add(combined_dict[env][metric]["std"], values["std"])
+-                        )
+-                        combined_dict_count[env][metric]["std_count"] += 1
+-                    elif not np.any(np.array(values["std"]) is None):
+-                        combined_dict[env][metric]["std"] = values["std"]
+-                        combined_dict_count[env][metric]["std_count"] += 1
+-
+-    # Calculate averages
+-    for env, meta_dict in combined_dict.items():
+-        for metric, values in meta_dict.items():
+-            combined_dict[env][metric]["y"] = list(
+-                np.array(combined_dict[env][metric]["y"]) / combined_dict_count[env][metric]["y_sum"]
+-            )
+-            if combined_dict_count[env][metric]["std_count"] > 0:
+-                combined_dict[env][metric]["std"] = list(
+-                    np.array(combined_dict[env][metric]["std"]) / combined_dict_count[env][metric]["std_count"]
+-                )
+-
+-    return combined_dict
+-
+-
+ def run_eval(runner: fdm_runner_cfg.FDMRunner, args_cli: argparse.Namespace):
+     # eval environments
+     meta_eval, test_meta = runner.eval_metric()
+@@ -151,9 +100,13 @@ def run_eval(runner: fdm_runner_cfg.FDMRunner, args_cli: argparse.Namespace):
+         assert runner.trainer.test_datasets is not None, "No test datasets available"
+         datasets = list(runner.trainer.test_datasets.keys())
+     else:
+-        datasets = (
+-            ["train"] if runner.trainer.dataloader is None else ["train"] + list(runner.trainer.test_datasets.keys())
+-        )
++        datasets = []
++        if runner.trainer.dataloader is not None:
++            datasets.append("train")
++        if runner.trainer.test_datasets:
++            datasets.extend(runner.trainer.test_datasets.keys())
++        if not datasets:
++            raise RuntimeError("No evaluation datasets available for plotting.")
+ 
+     # clean test datasets names
+     combined_suffix = ""
+@@ -174,7 +127,7 @@ def run_eval(runner: fdm_runner_cfg.FDMRunner, args_cli: argparse.Namespace):
+     # # create violin plot
+     vilion_plotter = ViolinPlotter(
+         datasets=datasets,
+-        models=["Ours", "Kim et al.", "Constant Vel."] if args_cli.ablation_mode is None else ["Ours", "Constant Vel."],
++        models=["Ours"],
+         env_sensor_cfg=runner.env.cfg.scene.env_sensor,
+         correct_collision_estimation_split=True,
+         collision_split=True,
+@@ -199,67 +152,6 @@ def run_eval(runner: fdm_runner_cfg.FDMRunner, args_cli: argparse.Namespace):
+                 save_path=os.path.join(dir_path, "plots"),
+             )
+ 
+-    # save fdm batch size
+-    fdm_batch_size = runner.trainer.cfg.batch_size
+-
+-    ###
+-    # Create baseline model data
+-    ###
+-
+-    if args_cli.ablation_mode is None:
+-        # close prev environment
+-        runner.close()
+-        # create a new stage
+-        omni.usd.get_context().new_stage()
+-        # del runner
+-        del runner
+-
+-        # include baseline in the tests --> load baseline method and rerun the evaluation
+-        args_cli.env = "baseline"
+-        args_cli.runs = None
+-        cfg = load_cfg()
+-        # avoid resampling the environment if generator is selected
+-        if args_cli.only_test_envs:
+-            cfg.env_cfg.scene.terrain.terrain_type = "usd"
+-        if args_cli.noise:
+-            cfg.trainer_cfg.load_run = "Jan09_23-18-02_Baseline_NewEnv_NewCollisionShape_noise"
+-        else:
+-            cfg.trainer_cfg.load_run = "Jan13_15-36-24_Baseline_NewEnv_NewCollisionShape_CorrLidar"
+-            # cfg.trainer_cfg.load_run = "Jan13_15-39-48_Baseline_NewEnv_NewCollisionShape_CorrLidar_Plane"
+-        cfg.trainer_cfg.batch_size = fdm_batch_size
+-        runner = fdm_runner_cfg.FDMRunner(cfg=cfg, args_cli=args_cli, eval=True)
+-        baseline_meta_eval, baseline_test_meta = runner.eval_metric()
+-        baseline_meta_eval_new = {}
+-        for key, value in baseline_meta_eval.items():
+-            new_key = key.replace("plot", "plot baseline", 1)
+-            baseline_meta_eval_new[new_key] = value
+-        for key, value in baseline_test_meta.items():
+-            new_key = key.replace("_baseline", " baseline", 1)
+-            baseline_meta_eval_new[new_key] = value
+-
+-        # create violin plot
+-        if not args_cli.only_test_envs:
+-            vilion_plotter.update_data(
+-                runner.model,
+-                runner.trainer.dataloader,
+-                "train",
+-                model_name="Kim et al.",
+-                baseline=True,
+-                save_path=os.path.join(dir_path, "plots"),
+-            )
+-        if runner.trainer.test_datasets is not None:
+-            for test_dataset_name, test_dataset in runner.trainer.test_datasets.items():
+-                vilion_plotter.update_data(
+-                    runner.model,
+-                    test_dataset,
+-                    test_dataset_name.removesuffix(f"_heightThreshold{args_cli.height_threshold}")
+-                    .removesuffix("_baseline")
+-                    .removesuffix("_EVAL_CFG"),
+-                    model_name="Kim et al.",
+-                    baseline=True,
+-                    save_path=os.path.join(dir_path, "plots"),
+-                )
+-
+     ###
+     # Create output data
+     ###
+@@ -311,53 +203,6 @@ def run_eval(runner: fdm_runner_cfg.FDMRunner, args_cli: argparse.Namespace):
+     plot_metrics_with_grid(step_meta_summary, os.path.join(dir_path, "plots"), step=True, only_first_row=True)
+     plot_metrics_with_grid(distance_meta_summary, os.path.join(dir_path, "plots"), only_first_row=True)
+ 
+-    # if ablation mode is not None, we do not need to plot the baseline
+-    if args_cli.ablation_mode is not None:
+-        print("Done evaluated the model")
+-        return
+-
+-    # -- plot with baseline
+-    distance_meta_summary, step_meta_summary = meta_summarize(meta_eval | test_meta | baseline_meta_eval_new)
+-
+-    # remove the train dataset
+-    if args_cli.only_test_envs:
+-        distance_meta_summary.pop("plot")
+-        step_meta_summary.pop("plot")
+-
+-    # keys are the dataset names, apply the the same remove of suffix and EVAL_CFG for each of the keys
+-    step_meta_summary_clean = combine_dicts([
+-        {
+-            key.removesuffix(f"_heightThreshold{args_cli.height_threshold}")
+-            .removesuffix(combined_suffix)
+-            .removesuffix("_EVAL_CFG")
+-            .removeprefix("plot_"): value
+-        }
+-        for key, value in step_meta_summary.items()
+-    ])
+-    # NOTE: update is technically not the correct version, instead use combine function but currently now working for distance metrics
+-    distance_meta_summary_clean = {}
+-    for key, value in distance_meta_summary.items():
+-        new_key = (
+-            key.removesuffix(f"_heightThreshold{args_cli.height_threshold}")
+-            .removesuffix(combined_suffix)
+-            .removesuffix("_EVAL_CFG")
+-            .removeprefix("plot_")
+-        )
+-        if new_key in distance_meta_summary_clean:
+-            distance_meta_summary_clean[new_key].update(value)
+-        else:
+-            distance_meta_summary_clean[new_key] = value
+-    # distance_meta_summary_clean = combine_dicts([{key.removesuffix(combined_suffix).removesuffix("_EVAL_CFG").removeprefix("plot_"): value} for key, value in distance_meta_summary.items()])
+-
+-    plot_metrics_with_grid(step_meta_summary_clean, os.path.join(dir_path, "plots"), step=True, suffix="_baseline")
+-    plot_metrics_with_grid(distance_meta_summary_clean, os.path.join(dir_path, "plots"), suffix="_baseline")
+-    plot_metrics_with_grid(
+-        step_meta_summary_clean, os.path.join(dir_path, "plots"), step=True, suffix="_baseline", only_first_row=True
+-    )
+-    plot_metrics_with_grid(
+-        distance_meta_summary_clean, os.path.join(dir_path, "plots"), suffix="_baseline", only_first_row=True
+-    )
+-
+     print("Done evaluated the model")
+ 
+ 
+diff --git a/scripts/plan_metric.py b/scripts/plan_metric.py
+index b9085c0..0f03ff5 100644
+--- a/scripts/plan_metric.py
++++ b/scripts/plan_metric.py
+@@ -56,8 +56,8 @@ import torch
+ import yaml
+ 
+ import omni
+-import wandb
+ from tabulate import tabulate
++from torch.utils.tensorboard import SummaryWriter
+ 
+ from isaaclab_tasks.utils import get_checkpoint_path
+ 
+@@ -124,28 +124,6 @@ def main():
+     # init metric dict
+     metrics: dict[str, dict[str, dict[str, float]]] = {}
+ 
+-    # init wandb logging
+-    if args_cli.mode == "full":
+-        wb_entity = os.getenv("WANDB_ENTITY")
+-        wb_mode = os.getenv("WANDB_MODE", "online")
+-        wb_api_key = os.getenv("WANDB_API_KEY")
+-
+-        if not wb_api_key:
+-            print("[WARNING] WANDB_API_KEY environment variable not set. Wandb logging will be disabled.")
+-            return
+-
+-        try:
+-            wandb.init(
+-                project="planner_eval",
+-                entity=wb_entity,
+-                name=args_cli.run,
+-                config=planner.cfg.to_dict() | planner.planner_cfg,
+-                dir=os.path.join("logs", "fdm", "fdm_se2_prediction_depth", args_cli.run),
+-                mode=wb_mode,
+-            )
+-        except:  # noqa: E722
+-            print("[WARNING: Wandb not available")
+-
+     num_paths = sum(planner.cfg.env_cfg.commands.command.trajectory_config["num_paths"])
+     min_length = min(planner.cfg.env_cfg.commands.command.trajectory_config["min_path_length"])
+     max_length = max(planner.cfg.env_cfg.commands.command.trajectory_config["max_path_length"])
+@@ -306,6 +284,25 @@ def main():
+     with open(os.path.join(log_dir, "comp_plots", "planner_statistics.tex"), "w") as f:
+         f.write(latex_table)
+ 
++    if args_cli.mode == "full":
++        tb_dir = os.path.join(planner.log_root_path, planner.cfg.load_run, "planner_eval_tensorboard")
++        os.makedirs(tb_dir, exist_ok=True)
++        with SummaryWriter(log_dir=tb_dir) as w:
++            for planner_name, planner_metrics in metrics.items():
++                for metric_name, subparts in planner_metrics.items():
++                    for subpart, val in subparts.items():
++                        if isinstance(val, (int, float)):
++                            w.add_scalar(f"{planner_name}/{metric_name}/{subpart}", float(val), 0)
++            try:
++                cfg_payload = {"planner_cfg": planner.cfg.to_dict(), "sampling_planner": dict(planner.planner_cfg)}
++                cfg_text = yaml.safe_dump(cfg_payload, default_flow_style=False)
++                if len(cfg_text) > 12000:
++                    cfg_text = cfg_text[:12000] + "\n... [truncated]"
++                w.add_text("planner_eval/config", cfg_text, 0)
++            except Exception as exc:
++                print(f"[WARNING] Could not log planner config to TensorBoard: {exc}")
++        print(f"[INFO] Planner evaluation TensorBoard log directory: {tb_dir}")
++
+ 
+ if __name__ == "__main__":
+     # run the main execution
+diff --git a/scripts/real_world_eval_metrics.py b/scripts/real_world_eval_metrics.py
+index ed886fa..ab0fa25 100644
+--- a/scripts/real_world_eval_metrics.py
++++ b/scripts/real_world_eval_metrics.py
+@@ -77,6 +77,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
+ from fdm import LARGE_UNIFIED_HEIGHT_SCAN
+ from fdm.utils.args_cli_utils import cfg_modifier_pre_init, robot_changes, runner_cfg_init
+ from fdm.utils.model_comp_plot import ViolinPlotter
++from fdm.utils.test_dataset_paths import resolve_eval_dataset_path
+ 
+ torch.backends.cuda.matmul.allow_tf32 = True
+ torch.backends.cudnn.allow_tf32 = True
+@@ -141,8 +142,8 @@ def main():
+             else:
+                 suffix = "_baseline"
+         if LARGE_UNIFIED_HEIGHT_SCAN:
+-            suffix += "_largeHeightScan"
+-        eval_dataset_path = os.path.join(log_dir, "test_datasets", f"{terrain_name}{suffix}_dataset.pkl")
++            suffix += "_largeUnifiedHeightScan"
++        eval_dataset_path = resolve_eval_dataset_path(log_dir, args_cli.robot, terrain_name, suffix)
+         if not os.path.isfile(eval_dataset_path):
+             print("[WARNING]: Eval dataset not found. Proceeding without datasets of the training environment.")
+         else:
+diff --git a/scripts/test_data_collector.py b/scripts/test_data_collector.py
+index 9cceb79..1011ef2 100644
+--- a/scripts/test_data_collector.py
++++ b/scripts/test_data_collector.py
+@@ -40,19 +40,21 @@ simulation_app = app_launcher.app
+ 
+ import os
+ import pickle
++import sys
+ import torch
+ 
+ import omni
+ 
+ import isaaclab.sim as sim_utils
+-from isaaclab.terrains import TerrainImporterCfg
++from nav_suite.terrains import NavTerrainImporterCfg
+ 
+ import fdm.mdp as mdp
+ import fdm.runner as fdm_runner_cfg
+-from fdm import FDM_DATA_DIR, LARGE_UNIFIED_HEIGHT_SCAN
++from fdm import LARGE_UNIFIED_HEIGHT_SCAN
+ from fdm.env_cfg import terrain_cfg as fdm_terrain_cfg
+ from fdm.env_cfg.env_cfg_base import TERRAIN_ANALYSIS_CFG
+ from fdm.utils.args_cli_utils import cfg_modifier_pre_init, env_modifier_post_init, robot_changes, runner_cfg_init
++from fdm.utils.test_dataset_paths import get_static_test_dataset_path
+ 
+ torch.backends.cuda.matmul.allow_tf32 = True
+ torch.backends.cudnn.allow_tf32 = True
+@@ -68,7 +70,7 @@ def main():
+     # modify cfg
+     cfg = cfg_modifier_pre_init(cfg, args_cli, dataset_collecton=True)
+     # change terrain config
+-    cfg.env_cfg.scene.terrain = TerrainImporterCfg(
++    cfg.env_cfg.scene.terrain = NavTerrainImporterCfg(
+         prim_path="/World/ground",
+         terrain_type="usd",
+         max_init_terrain_level=None,
+@@ -114,16 +116,14 @@ def main():
+     if os.path.exists(args_cli.test_env):
+         cfg.env_cfg.scene.terrain.terrain_type = "usd"
+         cfg.env_cfg.scene.terrain.usd_path = args_cli.test_env
+-        dataset_path = args_cli.test_env[:-4]
++        dataset_name = os.path.splitext(os.path.basename(args_cli.test_env))[0]
+     elif args_cli.test_env == "plane":
+         cfg.env_cfg.scene.terrain.terrain_type = "plane"
+-        os.makedirs(os.path.join(FDM_DATA_DIR, "Terrains/test_datasets"), exist_ok=True)
+-        dataset_path = os.path.join(FDM_DATA_DIR, "Terrains/test_datasets", args_cli.test_env)
++        dataset_name = args_cli.test_env
+     elif hasattr(fdm_terrain_cfg, args_cli.test_env):
+         cfg.env_cfg.scene.terrain.terrain_type = "generator"
+         cfg.env_cfg.scene.terrain.terrain_generator = getattr(fdm_terrain_cfg, args_cli.test_env)
+-        os.makedirs(os.path.join(FDM_DATA_DIR, "Terrains/test_datasets"), exist_ok=True)
+-        dataset_path = os.path.join(FDM_DATA_DIR, "Terrains/test_datasets", args_cli.test_env)
++        dataset_name = args_cli.test_env
+     else:
+         raise ValueError(f"Unknown terrain {args_cli.test_env}")
+     # create a new stage
+@@ -135,26 +135,35 @@ def main():
+     # collect validation dataset
+     runner._collect(eval=True)
+     # save dataset
+-    if args_cli.reduced_obs:
+-        dataset_path += "_reducedObs"
+-    if args_cli.remove_torque:
+-        dataset_path += "_noTorque"
+-    if args_cli.noise:
+-        dataset_path += "_noise"
+-    elif args_cli.occlusions:
+-        dataset_path += "_occlusions"
+-    if args_cli.env == "baseline":
+-        dataset_path += "_baseline"
++    dataset_filename = dataset_name
++    if args_cli.env != "baseline":
++        if args_cli.reduced_obs:
++            dataset_filename += "_reducedObs"
++        if args_cli.remove_torque:
++            dataset_filename += "_noTorque"
++        if args_cli.noise:
++            dataset_filename += "_noise"
++        elif args_cli.occlusions:
++            dataset_filename += "_occlusions"
++    else:
++        if args_cli.noise:
++            dataset_filename += "_noise"
++        dataset_filename += "_baseline"
+     if LARGE_UNIFIED_HEIGHT_SCAN:
+-        dataset_path += "_largeUnifiedHeightScan"
++        dataset_filename += "_largeUnifiedHeightScan"
+     if args_cli.height_threshold is not None:
+-        dataset_path += f"_heightThreshold{args_cli.height_threshold}"
+-    with open(dataset_path + ".pkl", "wb") as fp:
++        dataset_filename += f"_heightThreshold{args_cli.height_threshold}"
++    dataset_path = get_static_test_dataset_path(None, args_cli.robot, dataset_filename + ".pkl")
++    os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
++    with open(dataset_path, "wb") as fp:
+         pickle.dump(runner.trainer.val_dataset, fp)
+-    print(f"[INFO] Data saved to {dataset_path}.pkl")
++    print(f"[INFO] Data saved to {dataset_path}")
+ 
+ 
+ if __name__ == "__main__":
+     main()
+-    # close sim app
+-    simulation_app.close()
++    # Isaac Sim shutdown can hang after dataset export in this one-shot collector process.
++    # The dataset file is already closed at this point, so exit directly and let the wrapper launch the next step.
++    sys.stdout.flush()
++    sys.stderr.flush()
++    os._exit(0)
+diff --git a/scripts/train.py b/scripts/train.py
+index 8168af6..5c96872 100644
+--- a/scripts/train.py
++++ b/scripts/train.py
+@@ -35,7 +35,7 @@ parser.add_argument(
+     "--runs",
+     type=str,
+     nargs="+",
+-    default="Dec03_20-27-43_MergeSingleObjMazeTerrain_HeightScan_lr3e3_Ep8_CR20_AllOnceStructure_NonUniColl_NOPreTrained_Bs2048_Noise_reducedObs_Occlusion_NoTorque_NewHeightScanNoise_NewNNTrainNoise_SchedEp10_Wait4_Decay5e5",
++    default="",
+     help="Name of the run.",
+ )
+ parser.add_argument(
+@@ -44,22 +44,34 @@ parser.add_argument(
+     default=10,
+     help="Dilution factor for the real-world datasets, i.e. how many simulation batches per real-world batches.",
+ )
++parser.add_argument(
++    "--gui",
++    action="store_true",
++    default=False,
++    help="Show Isaac Sim window (disable headless). Prefer lower --num_envs on a single GPU.",
++)
+ 
+ # append common FDM cli arguments
+-cli_args.add_fdm_args(parser, default_num_envs=4096)
++cli_args.add_fdm_args(parser, default_num_envs=1024)
++DEFAULT_NUM_ENVS = 1024
+ # append AppLauncher cli args
+ AppLauncher.add_app_launcher_args(parser)
+ # parse the arguments
+ args_cli = parser.parse_args()
+ args_cli.headless = True
+ 
++if args_cli.gui:
++    args_cli.headless = False
++
+ if args_cli.mode == "debug":
+     args_cli.headless = False
+     args_cli.num_envs = 10
+     args_cli.terrain_analysis_points = 5000
+ elif args_cli.mode == "eval":
+-    args_cli.headless = True
+-    args_cli.num_envs = 2048
++    if not args_cli.gui:
++        args_cli.headless = True
++    if args_cli.num_envs == DEFAULT_NUM_ENVS:
++        args_cli.num_envs = 2048
+     args_cli.terrain_analysis_points = 5000
+ 
+ # launch omniverse app
+@@ -105,14 +117,24 @@ def run_eval(runner: FDMRunner):
+     # eval environments
+     meta_eval, test_meta = runner.eval_metric()
+ 
++    datasets = []
++    if runner.trainer.dataloader is not None:
++        datasets.append("train")
++    if runner.trainer.test_datasets:
++        datasets.extend(runner.trainer.test_datasets.keys())
++    if not runner.trainer.test_datasets:
++        print("[INFO] No static test datasets configured for this run. Generating evaluation plots from train data only.")
++    if not datasets:
++        raise RuntimeError("No evaluation datasets available for plotting.")
++
+     # create violin plot
+     vilion_plotter = ViolinPlotter(
+-        datasets=(
+-            ["train"] if runner.trainer.dataloader is None else ["train"] + list(runner.trainer.test_datasets.keys())
+-        ),
++        models=["fdm"],
++        datasets=datasets,
+         env_sensor_cfg=runner.cfg.env_cfg.scene.env_sensor,
+     )
+-    vilion_plotter.update_data(runner.model, runner.trainer.dataloader, "train")
++    if runner.trainer.dataloader is not None:
++        vilion_plotter.update_data(runner.model, runner.trainer.dataloader, "train")
+     if runner.trainer.test_datasets is not None:
+         for test_dataset_name, test_dataset in runner.trainer.test_datasets.items():
+             vilion_plotter.update_data(runner.model, test_dataset, test_dataset_name)
+@@ -129,38 +151,10 @@ def run_eval(runner: FDMRunner):
+     # del runner
+     del runner
+ 
+-    # include baseline in the tests --> load baseline method and rerun the evaluation
+-    args_cli.env = "baseline"
+-    args_cli.runs = None
+-    cfg = load_cfg()
+-    # limit number of samples
+-    cfg.trainer_cfg.num_samples = 50000
+-    # increase the resolution of the
+-    cfg.model_cfg.eval_distance_interval = 0.1
+-    runner = FDMRunner(cfg=cfg, args_cli=args_cli, eval=True)
+-    baseline_meta_eval, baseline_test_meta = runner.eval_metric()
+-    baseline_meta_eval_new = {}
+-    for key, value in baseline_meta_eval.items():
+-        new_key = key.replace("plot", "plot baseline", 1)
+-        baseline_meta_eval_new[new_key] = value
+-    for key, value in baseline_test_meta.items():
+-        new_key = key.replace("_baseline", " baseline", 1)
+-        baseline_meta_eval_new[new_key] = value
+-
+     # get path to save the plots
+     dir_path, _ = os.path.split(fdm_model_log_dir)
+     os.makedirs(os.path.join(dir_path, "plots"), exist_ok=True)
+ 
+-    # create violin plot
+-    vilion_plotter.update_data(runner.model, runner.trainer.dataloader, "train", baseline=True)
+-    if runner.trainer.test_datasets is not None:
+-        for test_dataset_name, test_dataset in runner.trainer.test_datasets.items():
+-            vilion_plotter.update_data(
+-                runner.model, test_dataset, test_dataset_name.removesuffix("_baseline"), baseline=True
+-            )
+-    # create the vilion plot
+-    vilion_plotter.plot_data(os.path.join(dir_path, "plots"))
+-
+     # Save the metrics in a grid plot
+     # -- plot without baseline
+     distance_meta_summary, step_meta_summary = meta_summarize(meta_eval | test_meta)
+@@ -173,16 +167,7 @@ def run_eval(runner: FDMRunner):
+         step_meta_summary, os.path.join(dir_path, "plots"), step=True, only_first_row=True, suffix="_first_row"
+     )
+ 
+-    # -- plot with baseline
+-    distance_meta_summary, step_meta_summary = meta_summarize(meta_eval | test_meta | baseline_meta_eval_new)
+-    plot_metrics_with_grid(distance_meta_summary, os.path.join(dir_path, "plots"), suffix="_baseline")
+-    plot_metrics_with_grid(step_meta_summary, os.path.join(dir_path, "plots"), step=True, suffix="_baseline")
+-    plot_metrics_with_grid(
+-        distance_meta_summary, os.path.join(dir_path, "plots"), suffix="_baseline_first_row", only_first_row=True
+-    )
+-    plot_metrics_with_grid(
+-        step_meta_summary, os.path.join(dir_path, "plots"), step=True, suffix="_baseline_first_row", only_first_row=True
+-    )
++    vilion_plotter.plot_data(os.path.join(dir_path, "plots"))
+ 
+     print("Done evaluated the model")
+ 
+diff --git a/scripts/utils/cli_args.py b/scripts/utils/cli_args.py
+index edd23f2..d1dc962 100644
+--- a/scripts/utils/cli_args.py
++++ b/scripts/utils/cli_args.py
+@@ -28,7 +28,7 @@ def add_fdm_args(parser: argparse.ArgumentParser, default_num_envs: int = 2048):
+         "--robot",
+         type=str,
+         default="anymal",
+-        choices=["anymal", "anymal_perceptive", "aow", "tytan", "tytan_quiet"],
++        choices=["anymal", "anymal_perceptive", "aow", "d5", "tytan", "tytan_quiet"],
+         help="Select the robot.",
+     )
+     parser.add_argument("--occlusions", action="store_true", default=False, help="Add occlusion to the observations.")
+diff --git a/home/cwl/fdm/exts/fdm/fdm/utils/configclass_patch.py b/exts/fdm/fdm/utils/configclass_patch.py
+new file mode 100644
+index 0000000..4f12644
+--- /dev/null
++++ b/exts/fdm/fdm/utils/configclass_patch.py
+@@ -0,0 +1,101 @@
++from __future__ import annotations
++
++import importlib
++import inspect
++
++configclass_mod = importlib.import_module("isaaclab.utils.configclass")
++
++
++def install_configclass_cycle_guard() -> None:
++    """Patch Isaac Lab config validation to avoid descending into runtime-mutated class objects.
++
++    Isaac Sim mutates some implementation classes referenced by ``*.class_type`` config fields at runtime.
++    When a second environment is constructed in the same process, Isaac Lab's stock ``_validate`` walks those
++    class objects recursively and can enter cycles such as ``RayCaster.meshes -> ... -> runtime.device_map``.
++
++    The guard below keeps validation focused on actual config data:
++    - skip Python classes, modules and bare functions/methods
++    - keep a visited set so repeated/shared objects do not recurse forever
++    """
++
++    validate_fn = configclass_mod._validate
++    if getattr(validate_fn, "_fdm_cycle_guard_installed", False):
++        return
++
++    def _safe_validate(
++        obj: object,
++        prefix: str = "",
++        _visited: set[int] | None = None,
++        _missing_fields: list[str] | None = None,
++    ) -> list[str]:
++        top_level = _visited is None and _missing_fields is None
++        if _visited is None:
++            _visited = set()
++        if _missing_fields is None:
++            _missing_fields = []
++
++        if type(obj).__name__ == "MeshConverterCfg":
++            pass
++        elif type(obj) is type(MISSING):
++            _missing_fields.append(prefix)
++        elif inspect.isclass(obj) or inspect.ismodule(obj) or inspect.isroutine(obj):
++            # ``class_type`` and other callable implementation hooks are not configuration trees.
++            pass
++        elif isinstance(obj, (list, tuple)):
++            obj_id = id(obj)
++            if obj_id not in _visited:
++                _visited.add(obj_id)
++                for index, item in enumerate(obj):
++                    current_path = f"{prefix}[{index}]"
++                    _validate(
++                        item,
++                        prefix=current_path,
++                        _visited=_visited,
++                        _missing_fields=_missing_fields,
++                    )
++        elif isinstance(obj, dict):
++            obj_id = id(obj)
++            if obj_id not in _visited:
++                _visited.add(obj_id)
++                if any(not isinstance(key, str) for key in obj.keys()):
++                    obj_dict = {str(key): value for key, value in obj.items()}
++                else:
++                    obj_dict = obj
++                for key, value in obj_dict.items():
++                    if key.startswith("__"):
++                        continue
++                    current_path = f"{prefix}.{key}" if prefix else key
++                    _validate(
++                        value,
++                        prefix=current_path,
++                        _visited=_visited,
++                        _missing_fields=_missing_fields,
++                    )
++        elif hasattr(obj, "__dict__"):
++            obj_id = id(obj)
++            if obj_id not in _visited:
++                _visited.add(obj_id)
++                for key, value in obj.__dict__.items():
++                    if key.startswith("__"):
++                        continue
++                    current_path = f"{prefix}.{key}" if prefix else key
++                    _validate(
++                        value,
++                        prefix=current_path,
++                        _visited=_visited,
++                        _missing_fields=_missing_fields,
++                    )
++
++        if top_level and _missing_fields:
++            formatted_message = "\n".join(f"  - {field}" for field in _missing_fields)
++            raise TypeError(
++                f"Missing values detected in object {obj.__class__.__name__} for the following"
++                f" fields:\n{formatted_message}\n"
++            )
++        return _missing_fields
++
++    # Mutate the original function object so already-decorated config classes pick up the new behavior.
++    validate_fn.__code__ = _safe_validate.__code__
++    validate_fn.__defaults__ = _safe_validate.__defaults__
++    validate_fn.__kwdefaults__ = _safe_validate.__kwdefaults__
++    validate_fn._fdm_cycle_guard_installed = True
+diff --git a/home/cwl/fdm/exts/fdm/fdm/utils/test_dataset_paths.py b/exts/fdm/fdm/utils/test_dataset_paths.py
+new file mode 100644
+index 0000000..cd21826
+--- /dev/null
++++ b/exts/fdm/fdm/utils/test_dataset_paths.py
+@@ -0,0 +1,71 @@
++# Copyright (c) 2025, ETH Zurich (Robotic Systems Lab)
++# Author: Pascal Roth
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++from __future__ import annotations
++
++import os
++
++from fdm import FDM_DATA_DIR
++
++
++def _get_log_dir_path(log_root_path: str) -> str:
++    abs_path = os.path.abspath(log_root_path)
++    return abs_path if os.path.basename(abs_path) == "fdm" else os.path.split(abs_path)[0]
++
++
++def get_test_dataset_root(log_root_path: str | None = None) -> str:
++    """Return the repository-local root directory for cached/static test datasets."""
++    if log_root_path is None:
++        return os.path.abspath(os.path.join("logs", "fdm", "test_datasets"))
++    return os.path.join(_get_log_dir_path(log_root_path), "test_datasets")
++
++
++def get_robot_test_dataset_dir(robot: str, log_root_path: str | None = None) -> str:
++    """Return the robot-scoped test dataset directory."""
++    return os.path.join(get_test_dataset_root(log_root_path), robot.lower())
++
++
++def replace_test_dataset_tokens(path_template: str, log_root_path: str, robot: str) -> str:
++    """Expand dataset path templates used by trainer configs."""
++    log_dir_path = _get_log_dir_path(log_root_path)
++    return path_template.replace("{LOG_DIR}", log_dir_path).replace("{ROBOT}", robot.lower())
++
++
++def get_static_test_dataset_path(log_root_path: str | None, robot: str, dataset_filename: str) -> str:
++    """Return the canonical robot-scoped path for a static test dataset pickle."""
++    return os.path.join(get_robot_test_dataset_dir(robot, log_root_path), dataset_filename)
++
++
++def resolve_static_test_dataset_path(path_template: str, log_root_path: str, robot: str) -> str:
++    """Resolve the preferred static test dataset path with compatibility fallbacks."""
++    primary_path = replace_test_dataset_tokens(path_template, log_root_path, robot)
++    filename = os.path.basename(primary_path)
++    flat_repo_path = os.path.join(get_test_dataset_root(log_root_path), filename)
++    legacy_ext_path = os.path.join(FDM_DATA_DIR, "Terrains", "test_datasets", filename)
++
++    for candidate in (primary_path, flat_repo_path, legacy_ext_path):
++        if os.path.isfile(candidate):
++            return candidate
++
++    return primary_path
++
++
++def get_eval_dataset_path(log_root_path: str, robot: str, terrain_name: str, suffix: str) -> str:
++    """Return the canonical path for a robot-scoped cached eval dataset."""
++    filename = f"{terrain_name}{suffix}_dataset.pkl"
++    return os.path.join(get_robot_test_dataset_dir(robot, log_root_path), filename)
++
++
++def resolve_eval_dataset_path(log_root_path: str, robot: str, terrain_name: str, suffix: str) -> str:
++    """Resolve a cached eval dataset path with compatibility fallback to the legacy flat layout."""
++    primary_path = get_eval_dataset_path(log_root_path, robot, terrain_name, suffix)
++    legacy_path = os.path.join(get_test_dataset_root(log_root_path), f"{terrain_name}{suffix}_dataset.pkl")
++
++    for candidate in (primary_path, legacy_path):
++        if os.path.isfile(candidate):
++            return candidate
++
++    return primary_path
+diff --git a/home/cwl/fdm/scripts/inspect_config_cycle.py b/scripts/inspect_config_cycle.py
+new file mode 100644
+index 0000000..e7420cc
+--- /dev/null
++++ b/scripts/inspect_config_cycle.py
+@@ -0,0 +1,280 @@
++from __future__ import annotations
++
++import argparse
++import inspect
++import os
++import sys
++import traceback
++from collections.abc import Mapping, Sequence
++from types import SimpleNamespace
++
++
++def _is_scalar(obj: object) -> bool:
++    return obj is None or isinstance(obj, (bool, int, float, str, bytes))
++
++
++def _is_leaf_callable(obj: object) -> bool:
++    return inspect.isroutine(obj) or inspect.ismethod(obj) or inspect.isfunction(obj) or inspect.isbuiltin(obj)
++
++
++def _iter_children(obj: object):
++    if _is_scalar(obj):
++        return
++    if _is_leaf_callable(obj) or isinstance(obj, type) or inspect.ismodule(obj):
++        return
++
++    if isinstance(obj, Mapping):
++        for key, value in obj.items():
++            yield f"[{key!r}]", value
++        return
++
++    if isinstance(obj, (list, tuple)):
++        for index, value in enumerate(obj):
++            yield f"[{index}]", value
++        return
++
++    obj_dict = getattr(obj, "__dict__", None)
++    if obj_dict is None:
++        return
++
++    for key, value in obj_dict.items():
++        if key.startswith("__"):
++            continue
++        yield f".{key}", value
++
++
++def _find_cycle(root: object, root_name: str) -> tuple[str, str, str] | None:
++    active_paths: dict[int, str] = {}
++    visited: set[int] = set()
++
++    def _dfs(obj: object, path: str):
++        if _is_scalar(obj) or _is_leaf_callable(obj) or isinstance(obj, type) or inspect.ismodule(obj):
++            return None
++
++        obj_id = id(obj)
++        if obj_id in active_paths:
++            return active_paths[obj_id], path, type(obj).__name__
++        if obj_id in visited:
++            return None
++
++        visited.add(obj_id)
++        active_paths[obj_id] = path
++        for suffix, child in _iter_children(obj) or ():
++            result = _dfs(child, f"{path}{suffix}")
++            if result is not None:
++                return result
++        active_paths.pop(obj_id, None)
++        return None
++
++    return _dfs(root, root_name)
++
++
++def _collect_mutable_paths(root: object, root_name: str, limit: int = 20000) -> dict[int, list[str]]:
++    visited: set[int] = set()
++    paths: dict[int, list[str]] = {}
++
++    def _dfs(obj: object, path: str):
++        if len(visited) >= limit:
++            return
++        if _is_scalar(obj) or _is_leaf_callable(obj) or isinstance(obj, type) or inspect.ismodule(obj):
++            return
++
++        is_mutable_container = isinstance(obj, (Mapping, list, tuple)) or hasattr(obj, "__dict__")
++        if not is_mutable_container:
++            return
++
++        obj_id = id(obj)
++        if obj_id in visited:
++            paths.setdefault(obj_id, []).append(path)
++            return
++
++        visited.add(obj_id)
++        paths.setdefault(obj_id, []).append(path)
++        for suffix, child in _iter_children(obj) or ():
++            _dfs(child, f"{path}{suffix}")
++
++    _dfs(root, root_name)
++    return paths
++
++
++def _format_shared_objects(left_name: str, left_root: object, right_name: str, right_root: object) -> list[str]:
++    left_paths = _collect_mutable_paths(left_root, left_name)
++    right_paths = _collect_mutable_paths(right_root, right_name)
++    shared = []
++    for obj_id in sorted(set(left_paths).intersection(right_paths)):
++        left_path = left_paths[obj_id][0]
++        right_path = right_paths[obj_id][0]
++        if left_path == left_name and right_path == right_name:
++            continue
++        shared.append(f"id={obj_id} {left_path} <-> {right_path}")
++        if len(shared) >= 20:
++            break
++    return shared
++
++
++def _build_args(cli_args) -> SimpleNamespace:
++    return SimpleNamespace(
++        env=cli_args.env,
++        robot=cli_args.robot,
++        reduced_obs=cli_args.reduced_obs,
++        remove_torque=cli_args.remove_torque,
++        noise=cli_args.noise,
++        occlusions=cli_args.occlusions,
++        ablation_mode=cli_args.ablation_mode,
++        timestamp=cli_args.timestamp,
++        friction=cli_args.friction,
++        regular=cli_args.regular,
++        terrain_analysis_points=cli_args.terrain_analysis_points,
++        num_envs=cli_args.num_envs,
++        run_name=cli_args.run_name,
++        runs=["SOME_RUN"],
++        resume=None,
++    )
++
++
++def _load_cfg(args_cli):
++    if "omni.log" not in sys.modules:
++        try:
++            import omni.log  # noqa: F401
++        except ModuleNotFoundError:
++            import types
++
++            omni_module = sys.modules.setdefault("omni", types.ModuleType("omni"))
++            omni_log_module = types.ModuleType("omni.log")
++            omni_log_module.warn = lambda *args, **kwargs: None
++            omni_module.log = omni_log_module
++            sys.modules["omni.log"] = omni_log_module
++
++    from fdm.utils.args_cli_utils import (
++        ablation_studies_modifications,
++        cfg_modifier_pre_init,
++        robot_changes,
++        runner_cfg_init,
++    )
++
++    cfg = runner_cfg_init(args_cli)
++    cfg = robot_changes(cfg, args_cli)
++    cfg = cfg_modifier_pre_init(cfg, args_cli)
++    cfg = ablation_studies_modifications(cfg, args_cli)
++    return cfg
++
++
++def _log(fh, message: str):
++    fh.write(message + "\n")
++    fh.flush()
++
++
++def main():
++    parser = argparse.ArgumentParser(description="Inspect FDM config objects for cycles between sequential loads.")
++    parser.add_argument("--env", type=str, default="height", choices=["height", "depth"])
++    parser.add_argument("--robot", type=str, default="d5")
++    parser.add_argument("--num_envs", type=int, default=32)
++    parser.add_argument("--run_name", type=str, default="cycle_probe")
++    parser.add_argument("--log", type=str, default="config_cycle_report.txt")
++    parser.add_argument("--noise", action="store_true", default=False)
++    parser.add_argument("--occlusions", action="store_true", default=False)
++    parser.add_argument("--reduced_obs", action="store_true", default=True)
++    parser.add_argument("--remove_torque", action="store_true", default=True)
++    parser.add_argument("--friction", action="store_true", default=False)
++    parser.add_argument("--regular", action="store_true", default=False)
++    parser.add_argument("--ablation_mode", type=str, default=None)
++    parser.add_argument("--timestamp", type=float, default=None)
++    parser.add_argument("--terrain_analysis_points", type=int, default=None)
++    parser.add_argument("--launch_app", action="store_true", default=False)
++    parser.add_argument("--instantiate_first_runner", action="store_true", default=False)
++    parser.add_argument("--instantiate_second_runner", action="store_true", default=False)
++    cli_args = parser.parse_args()
++
++    if cli_args.instantiate_first_runner or cli_args.instantiate_second_runner:
++        cli_args.launch_app = True
++
++    os.makedirs(os.path.dirname(cli_args.log) or ".", exist_ok=True)
++
++    simulation_app = None
++    runner = None
++
++    with open(cli_args.log, "w", encoding="utf-8") as fh:
++        _log(fh, "START inspect_config_cycle")
++        _log(fh, f"args={vars(cli_args)}")
++        try:
++            if cli_args.launch_app:
++                from isaaclab.app import AppLauncher
++
++                _log(fh, "Launching AppLauncher(headless=True)...")
++                app_launcher = AppLauncher({"headless": True})
++                simulation_app = app_launcher.app
++
++            args_cli = _build_args(cli_args)
++
++            _log(fh, f"Building cfg1 ({args_cli.env})...")
++            cfg1 = _load_cfg(args_cli)
++            cycle1 = _find_cycle(cfg1.env_cfg, "cfg1.env_cfg")
++            _log(fh, f"cfg1 cycle={cycle1}")
++
++            if cli_args.instantiate_first_runner:
++                _log(fh, "Instantiating first runner...")
++                import omni
++                from fdm.runner import FDMRunner
++                from fdm.utils.args_cli_utils import env_modifier_post_init
++
++                runner = FDMRunner(cfg=cfg1, args_cli=args_cli, eval=False)
++                runner = env_modifier_post_init(runner, args_cli=args_cli)
++                _log(fh, "Closing first runner and resetting stage...")
++                runner.close()
++                runner = None
++                omni.usd.get_context().new_stage()
++
++            _log(fh, "Switching to baseline cfg2...")
++            args_cli.env = "baseline"
++            args_cli.runs = None
++            cfg2 = _load_cfg(args_cli)
++
++            cycle2 = _find_cycle(cfg2.env_cfg, "cfg2.env_cfg")
++            _log(fh, f"cfg2 cycle={cycle2}")
++
++            shared = _format_shared_objects("cfg1.env_cfg", cfg1.env_cfg, "cfg2.env_cfg", cfg2.env_cfg)
++            if shared:
++                _log(fh, "shared mutable objects between cfg1/cfg2:")
++                for item in shared:
++                    _log(fh, f"  {item}")
++            else:
++                _log(fh, "shared mutable objects between cfg1/cfg2: none detected")
++
++            if cli_args.instantiate_second_runner:
++                _log(fh, "Instantiating second runner...")
++                from fdm.runner import FDMRunner
++
++                runner = FDMRunner(cfg=cfg2, args_cli=args_cli, eval=True)
++                _log(fh, "Second runner setup: OK")
++                runner.close()
++                runner = None
++            else:
++                _log(fh, "Validating cfg2.env_cfg...")
++                try:
++                    cfg2.env_cfg.validate()
++                    _log(fh, "cfg2.env_cfg.validate(): OK")
++                except Exception as exc:  # noqa: BLE001
++                    _log(fh, f"cfg2.env_cfg.validate(): {type(exc).__name__}: {exc}")
++                    _log(fh, traceback.format_exc())
++
++        except Exception as exc:  # noqa: BLE001
++            _log(fh, f"UNHANDLED: {type(exc).__name__}: {exc}")
++            _log(fh, traceback.format_exc())
++        finally:
++            if runner is not None:
++                try:
++                    runner.close()
++                except Exception:  # noqa: BLE001
++                    _log(fh, "runner.close() failed during cleanup")
++                    _log(fh, traceback.format_exc())
++            if simulation_app is not None:
++                try:
++                    simulation_app.close()
++                except Exception:  # noqa: BLE001
++                    _log(fh, "simulation_app.close() failed during cleanup")
++                    _log(fh, traceback.format_exc())
++        _log(fh, "END inspect_config_cycle")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/home/cwl/fdm/scripts/verify_heightmap_transforms.py b/scripts/verify_heightmap_transforms.py
+new file mode 100644
+index 0000000..f9dc5cc
+--- /dev/null
++++ b/scripts/verify_heightmap_transforms.py
+@@ -0,0 +1,196 @@
++#!/usr/bin/env python3
++"""Automated checks for the height-map coordinate conventions.
++
++This script is intentionally simulator-free. It validates the transforms that are
++used across:
++
++1. nav_d5 -> FDM observation conversion
++2. FDM -> nav_d5 display alignment
++3. model / planner local-map index conventions
++
++If one of these conventions changes, the script exits non-zero.
++"""
++
++from __future__ import annotations
++
++import argparse
++import sys
++from dataclasses import dataclass
++from pathlib import Path
++
++import numpy as np
++
++
++@dataclass(frozen=True)
++class HeightMapCfg:
++    resolution: float = 0.05
++    shape_x: int = 100
++    shape_y: int = 100
++    scan_cut_x_min: float = -0.5
++    scan_cut_x_max: float = 1.0
++    scan_cut_y_min: float = -1.0
++    scan_cut_y_max: float = 1.0
++    sensor_offset_x: float = 0.0
++    sensor_offset_y: float = 0.0
++
++    @property
++    def scan_center_x(self) -> float:
++        return self.shape_x / 2
++
++    @property
++    def scan_center_y(self) -> float:
++        return 0.5 / self.resolution
++
++
++def nav_to_fdm(nav_height_map: np.ndarray) -> np.ndarray:
++    """Mirror of the conversion used in scripts/real_world_test.py."""
++    return np.flip(np.rot90(nav_height_map, 1), axis=0)
++
++
++def fdm_to_nav(fdm_height_map: np.ndarray) -> np.ndarray:
++    """Inverse of nav_to_fdm."""
++    return np.rot90(np.flip(fdm_height_map, axis=0), k=-1)
++
++
++def verify_display_alignment(fdm_height_map: np.ndarray) -> np.ndarray:
++    """Mirror of the visualization alignment used in scripts/verify_d5_robot_import.py."""
++    nav_aligned = np.rot90(np.flip(fdm_height_map, axis=0), k=-1)
++    return np.flip(nav_aligned, axis=0)
++
++
++def flatten_roundtrip_ok(nav_height_map: np.ndarray) -> tuple[bool, str]:
++    fdm_height_map = nav_to_fdm(nav_height_map)
++    recovered = fdm_to_nav(fdm_height_map)
++    if not np.array_equal(nav_height_map, recovered):
++        return False, "nav_to_fdm and fdm_to_nav are not inverse transforms"
++
++    aligned = verify_display_alignment(fdm_height_map)
++    if not np.array_equal(aligned, np.flip(nav_height_map, axis=0)):
++        return False, "verify display alignment does not match the documented convention"
++
++    return True, "round-trip transform checks passed"
++
++
++def model_center_index(state_xy: tuple[float, float], cfg: HeightMapCfg) -> tuple[int, int]:
++    """Index convention used by FDM height_scan_cut() for the robot center.
++
++    The code uses:
++        x_idx = -y / res + center_x
++        y_idx =  x / res + center_y
++    """
++
++    x, y = state_xy
++    idx_x = int(np.rint(-y / cfg.resolution + cfg.scan_center_x))
++    idx_y = int(np.rint(x / cfg.resolution + cfg.scan_center_y))
++    return idx_x, idx_y
++
++
++def planner_center_index(state_xy: tuple[float, float], cfg: HeightMapCfg) -> tuple[int, int]:
++    """Index convention used by planner cost_map_cost()."""
++
++    x, y = state_xy
++    grid_size_x = int(np.rint(cfg.shape_x))
++    grid_size_y = int(np.rint(cfg.shape_y))
++    idx_x = int(np.rint(grid_size_x / 2 - cfg.sensor_offset_y / cfg.resolution - y / cfg.resolution))
++    idx_y = int(np.rint(grid_size_y / 2 - cfg.sensor_offset_x / cfg.resolution + x / cfg.resolution))
++    return idx_x, idx_y
++
++
++def run_axis_checks(cfg: HeightMapCfg) -> list[str]:
++    msgs: list[str] = []
++    origin_model = model_center_index((0.0, 0.0), cfg)
++    origin_planner = planner_center_index((0.0, 0.0), cfg)
++
++    one_step = cfg.resolution
++    model_px = model_center_index((one_step, 0.0), cfg)
++    model_py = model_center_index((0.0, one_step), cfg)
++    planner_px = planner_center_index((one_step, 0.0), cfg)
++    planner_py = planner_center_index((0.0, one_step), cfg)
++
++    if (model_px[0] - origin_model[0], model_px[1] - origin_model[1]) != (0, 1):
++        raise AssertionError(
++            f"Model +x convention mismatch: expected (0, +1), got {(model_px[0] - origin_model[0], model_px[1] - origin_model[1])}"
++        )
++    if (model_py[0] - origin_model[0], model_py[1] - origin_model[1]) != (-1, 0):
++        raise AssertionError(
++            f"Model +y convention mismatch: expected (-1, 0), got {(model_py[0] - origin_model[0], model_py[1] - origin_model[1])}"
++        )
++    if (planner_px[0] - origin_planner[0], planner_px[1] - origin_planner[1]) != (0, 1):
++        raise AssertionError(
++            f"Planner +x convention mismatch: expected (0, +1), got {(planner_px[0] - origin_planner[0], planner_px[1] - origin_planner[1])}"
++        )
++    if (planner_py[0] - origin_planner[0], planner_py[1] - origin_planner[1]) != (-1, 0):
++        raise AssertionError(
++            f"Planner +y convention mismatch: expected (-1, 0), got {(planner_py[0] - origin_planner[0], planner_py[1] - origin_planner[1])}"
++        )
++
++    msgs.append(f"model origin index = {origin_model}, planner origin index = {origin_planner}")
++    msgs.append("model/planner axis conventions match for one-cell offsets")
++    return msgs
++
++
++def synthetic_height_map(shape_x: int, shape_y: int) -> np.ndarray:
++    """Generate a unique-valued map so flips/rotations are obvious."""
++    x_idx = np.arange(shape_x)[:, None]
++    y_idx = np.arange(shape_y)[None, :]
++    return x_idx * 1000 + y_idx
++
++
++def maybe_save_examples(save_dir: Path | None, nav_map: np.ndarray, fdm_map: np.ndarray, aligned: np.ndarray) -> None:
++    if save_dir is None:
++        return
++
++    save_dir.mkdir(parents=True, exist_ok=True)
++    try:
++        import matplotlib.pyplot as plt
++    except ImportError:
++        print("[WARN] matplotlib not installed, skipping image export.")
++        return
++
++    fig, axs = plt.subplots(1, 3, figsize=(12, 4))
++    axs[0].imshow(nav_map, cmap="viridis")
++    axs[0].set_title("nav input")
++    axs[1].imshow(fdm_map, cmap="viridis")
++    axs[1].set_title("FDM obs")
++    axs[2].imshow(aligned, cmap="viridis")
++    axs[2].set_title("verify alignment")
++    for ax in axs:
++        ax.axis("off")
++    fig.tight_layout()
++    fig.savefig(save_dir / "heightmap_transform_check.png", dpi=180)
++    plt.close(fig)
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description="Automated check for FDM/nav_d5 height-map transforms.")
++    parser.add_argument("--resolution", type=float, default=0.05, help="Height-map resolution in meters.")
++    parser.add_argument("--shape-x", type=int, default=100, help="Height-map size in x / row dimension.")
++    parser.add_argument("--shape-y", type=int, default=100, help="Height-map size in y / column dimension.")
++    parser.add_argument("--save-dir", type=str, default="", help="Optional directory to save example images.")
++    return parser.parse_args()
++
++
++def main() -> int:
++    args = parse_args()
++    cfg = HeightMapCfg(resolution=args.resolution, shape_x=args.shape_x, shape_y=args.shape_y)
++
++    nav_map = synthetic_height_map(cfg.shape_x, cfg.shape_y)
++    ok, message = flatten_roundtrip_ok(nav_map)
++    if not ok:
++        print(f"[FAIL] {message}")
++        return 1
++    print(f"[OK] {message}")
++
++    for msg in run_axis_checks(cfg):
++        print(f"[OK] {msg}")
++
++    fdm_map = nav_to_fdm(nav_map)
++    aligned = verify_display_alignment(fdm_map)
++    maybe_save_examples(Path(args.save_dir) if args.save_dir else None, nav_map, fdm_map, aligned)
++
++    print("[OK] all height-map transform checks passed")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
